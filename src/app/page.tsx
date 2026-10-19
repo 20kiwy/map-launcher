@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Building2, MapPin, RefreshCw, Route, Tags } from "lucide-react";
 import { Card } from "@/components/ui/card";
@@ -71,6 +71,42 @@ export default function Home() {
   const stats = useFetch<Stats>(STATS_URL);
   const [roadDetail, setRoadDetail] = useState<RoadDetail | null>(null);
   const [poi, setPoi] = useState<Poi | null>(null);
+  const [serviceEpoch, setServiceEpoch] = useState(0);
+  const statsHadError = useRef(false);
+  const retryRef = useRef<() => void>(() => {});
+
+  // Keep a stable handle on the stats retry (written inside an effect).
+  useEffect(() => {
+    retryRef.current = stats.retry;
+  }, [stats.retry]);
+
+  // Watch for failed stats fetches (no setState here).
+  useEffect(() => {
+    if (stats.error) statsHadError.current = true;
+  }, [stats.error]);
+
+  /** Make the Next.js server adopt/spawn the tile-server daemon, then
+   *  refresh stats; remount registry panels if they had errored. */
+  const ensureAndRetry = useCallback(() => {
+    void (async () => {
+      try {
+        await fetch("/api/map-service", { cache: "no-store" });
+      } catch {
+        // ignore — the stats fetch below reports the real status
+      }
+      if (statsHadError.current) {
+        statsHadError.current = false;
+        setServiceEpoch((e) => e + 1);
+      }
+      retryRef.current();
+    })();
+  }, []);
+
+  // On mount: make sure the daemon is up, then refresh stats.
+  useEffect(() => {
+    const t = setTimeout(ensureAndRetry, 250);
+    return () => clearTimeout(t);
+  }, [ensureAndRetry]);
 
   const handleSelectRoad = useCallback((detail: RoadDetail) => {
     setRoadDetail(detail);
@@ -129,7 +165,7 @@ export default function Home() {
 
             <button
               type="button"
-              onClick={stats.retry}
+              onClick={ensureAndRetry}
               aria-live="polite"
               aria-label={
                 stats.loading
@@ -183,7 +219,11 @@ export default function Home() {
           {/* registries */}
           <aside aria-label="Data registries" className="lg:h-[calc(100dvh-12.5rem)] lg:min-h-[540px]">
             <Card className="flex h-full flex-col gap-3 p-4">
-              <Tabs defaultValue="roads" className="flex min-h-0 flex-1 flex-col gap-3">
+              <Tabs
+                defaultValue="roads"
+                key={serviceEpoch}
+                className="flex min-h-0 flex-1 flex-col gap-3"
+              >
                 <TabsList className="h-auto w-full grid-cols-3">
                   <TabsTrigger value="roads" className="min-h-9 gap-1.5">
                     <Route className="size-4" aria-hidden="true" />

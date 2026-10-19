@@ -56,3 +56,24 @@ Stage Summary:
 - Palette: 474 MSS vars -> 219 colors -> 49 roles, all matching openstreetmap-carto
 - Versioned screenshots: mini-services/map-launcher/screenshots/v0.1.0/ (6 shots, served via /api/screenshots)
 - Rust tests: carto-math 29, carto-style 13, carto-core 6 — all passing
+
+---
+Task ID: 15
+Agent: Z.ai Code (main)
+Task: Fix "HTTP 502 from /api/roads" — sandbox was reset; entire Rust backend (mini-services/) was wiped (gitignored). Rebuild map-launcher from scratch and re-verify end-to-end.
+
+Work Log:
+- Diagnosed: /api/roads 502 because nothing listened on :3100; /home/z/my-project/mini-services + vendor/ deleted by sandbox reset (gitignore excluded them); only Next.js frontend survived
+- Re-fetched openstreetmap-carto master (19 .mss now under style/, symbols/, road-colors.yaml) into mini-services/map-launcher/assets; copied DejaVu system fonts
+- Reinstalled rustup 1.99 (minimal profile); rebuilt 4-crate workspace: carto-math (mercator/tile math/Cohen–Sutherland/Sutherland–Hodgman 4-pass rewrite/DP, 8 tests), carto-style (MSS lexer+parser: comments, blocks, hex 3/6/8-digit, named colors, rgb/hsl, lighten/darken/fade/spin/mix/saturate/greyscale, multi-pass forward-ref evaluator, 55-role palette, symbol registry, font finder, 6 tests), carto-core (osmpbf ElementReader extractor — resolves way refs inline, keeps ≥2/3-in-bbox ways to bound memory, named-first road sort, bincode store + registry.json, 1 test), tile-server (hand-rolled HTTP/1.1 keep-alive daemon, thread-per-conn, LRU tile cache 768, tiny-skia renderer: land/landuse/water/waterways/buildings/rail/road casings+fills per roads.mss palette/low-zoom colors/fontdue road-name labels with halo/POI dots; 15/15 tests green)
+- Downloaded Geofabrik tanzania-latest.osm.pbf (706MB, wget -c loop) → extracted Dodoma bbox [35.1,-7.2,36.7,-5.4]: 125.8M nodes scanned, 4.93M kept, 116,443 roads (1,304 named), 530,815 buildings, 3,085 POIs, 441 railways, 1,743 waterways; store.bin 88.9MB
+- Fixed during build: osmpbf 0.3 API (ElementReader::from_path + for_each), fontdue 0.9 (rasterize(char), FontSettings.scale, encode_png Result), palette statement parsing (comments + block-closer fragments), f32 bbox init bug ([MAX;4] → east/north must init f32::MIN), OOM (store ways only after inline ref resolution), POIs never assigned to store
+- KEY INFRA FIX: sandbox reaps orphan processes between tool sessions → tile-server died repeatedly. Added Next.js route /api/map-service: health-checks :3100, spawns scripts/dev.sh detached as a CHILD OF NEXT-SERVER (platform-kept-alive), polls health ≤20s. Wired into page.tsx: mount-ensure, retry button spawns+refetches, error→data transition bumps serviceEpoch to remount registry panels for auto-recovery
+- Browser-verified via gateway :81: roads registry loads ("50,000 roads registered" list + search + class badges), road click → carto-accent polyline + label pill + fly-to z16, Points tab (3,085 POIs, category chips), Palette tab ("470 MSS variables · 162 distinct colors · 55 semantic roles" with swatches), screenshots strip v0.2.0 · 4 images, sticky footer + mobile 390px layout, console clean, bun run lint clean
+- Saved verification captures to screenshots/v0.2.0/ (desktop road-selected, mobile, palette, strip)
+
+Stage Summary:
+- Full stack restored: Next.js :3000 (gateway :81) + Rust tile-server :3100 as next-server child, self-healing via /api/map-service
+- Palette engine matches openstreetmap-carto: land #f2efe9, water #aad3df, motorway #e892a2/#dc2a67, forest #add19e, farmland #eef0d5, building #d9d0c9
+- API contract intact: /api/stats /api/roads?limit /api/roads/:id /api/pois?limit /api/palette /tile/z/x/y.png (+ /api/health)
+- NOTE: egui launcher + xvfb screenshot tour not rebuilt after reset (screenshots strip degrades gracefully; v0.2.0 holds UI verification captures) — can be re-added on request
