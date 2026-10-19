@@ -103,3 +103,27 @@ Stage Summary:
 - App: deep zoom z5-19 working end-to-end; oneway arrows + lanes/maxspeed in tiles, registry API and UI; craft-launcher-style system fonts (Noto Sans first per fonts.mss)
 - CI green on Linux AND Windows building all 4 crates + UI; binaries as artifacts
 - Screenshots versioned v0.2.0 + v0.3.0 in repo
+
+---
+Task ID: 17
+Agent: Z.ai Code (main)
+Task: Fix Windows release experience — bare tile-server.exe had no palette/fonts/data; no GitHub release tags existed for the Next.js build + binaries. Add tagged releases with runnable Windows/Linux binaries, web build and map-data pack.
+
+Work Log:
+- Diagnosed user's Windows run log: palette 0 vars (assets resolved via CWD + CARGO_MANIFEST_DIR build-machine paths), fonts only found by luck, store.bin missing with no guidance; no tags/releases in repo
+- carto-style: embedded the verbatim openstreetmap-carto assets with include_dir — EMBEDDED_STYLE (19 .mss), EMBEDDED_SYMBOLS (full SVG/PNG tree), EMBEDDED_FONTS (DejaVu); Palette::from_mss_sources/from_embedded, SymbolRegistry::embedded(), embedded_font() bytes API; disk assets/ still takes precedence for dev
+- Font scoring fixes: Windows 'bd'/'b' bold stems (arialbd/segoeuib) scored for bold; bold faces penalized when Regular requested (DejaVuSans-Bold no longer picked as regular); load_map_font gains Windows last-resort families (Segoe UI, Arial, Tahoma)
+- tile-server: resolve_data_dir (--data-dir flag > MAP_LAUNCHER_DATA > ./data > exe_dir/data > exe_dir, first dir containing store.bin wins, all searched paths reported), load_font_face with embedded DejaVu fallback, palette source label in banner, bind-failure hint, version from CARGO_PKG_VERSION; workspace/package.json versions -> 0.4.0
+- Next.js: same-origin proxy routes /api/{stats,health,roads,roads/[id],pois,palette} + /tile/[z]/[x]/[y] (src/lib/tile-proxy.ts, TILE_SERVER_URL env override); map-api.ts gwUrl/tileUrl switched from gateway XTransformPort to proxy routes (works in sandbox AND local Windows deployment); map-service route Windows-aware (no spawn, clear offline hint); fixed broken .gitignore line (/agent-ctxtool-results/ -> /agent-ctx + /tool-results/), untracked tool-results/
+- release.yml: tags v* -> matrix (ubuntu/windows) cargo build+test -> packaged zips/tar.gz with README.txt + data/registry.json + sha256; web job: bun lint + build (standalone) -> map-launcher-web zip with README.txt; release job -> softprops/action-gh-release
+- Docs: README-RELEASE.md (Windows quickstart: exe + map-data + web zip in one folder, node server.js), README-WEB.md, README.md Releases/Embedded-assets sections
+- Rebuilt data (sandbox reset had wiped PBF): re-downloaded tanzania-latest.osm.pbf 706MB (resumed curl), re-extracted Dodoma bbox: 116,443 roads (1,304 named), 530,815 buildings, 3,085 POIs; store.bin 89.3MB
+- Verification: 19/19 cargo tests green (incl. new embedded palette/symbols/fonts tests); bare-exe test in asset-free dir -> palette[embedded] 470 vars/162 colors/55 roles/976 symbols, tiles render, clear data-fix message; bun lint clean; agent-browser: stats chips 116,443 roads, roads registry + road click -> accent polyline + info bar (direction/lanes/maxspeed), z17 deep zoom, oneway arrows, Palette tab 470 vars, Points tab 3,085 POIs, mobile 390px, footer gap 0, console clean
+- Git: committed v0.4.0 (09c3e58) to main; tag v0.4.0 pushed; CI: release run 39265110453 SUCCESS, build run 39265074675 SUCCESS (Linux + Windows)
+- Release v0.4.0 assets verified by downloading them back: tile-server-v0.4.0-windows-x64.zip (exe 11MB self-contained + README + registry.json), tile-server-v0.4.0-linux-x64.tar.gz, map-launcher-web-v0.4.0.zip (30.3MB standalone), map-data-v0.4.0.zip (39.9MB store.bin+registry.json, uploaded via API) + sha256s; end-to-end test of the actual Linux release artifact + data pack -> full registry + tiles
+
+Stage Summary:
+- GitHub release https://github.com/20kiwy/map-launcher/releases/tag/v0.4.0 with 8 assets (Windows/Linux binaries, Next.js web build, map data, checksums)
+- Release binaries are self-contained: full openstreetmap-carto palette+symbols+fonts embedded; bare exe boots anywhere
+- Web UI proxy architecture works without the sandbox gateway -> local Windows deployments run tile-server.exe + node server.js
+- NOTE: GitHub token remains exposed in chat history — rotate it
