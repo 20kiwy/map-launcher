@@ -1,0 +1,11 @@
+[package]
+name = "tile-server-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tile-server-cli"
+path = "src/main.rs"
+
+[dependencies]
+tile-server-core = { path = "../tile-server-core" }

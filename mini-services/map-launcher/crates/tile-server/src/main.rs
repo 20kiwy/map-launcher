@@ -1,1129 +1,63 @@
-//! map-launcher tile server — pure Rust HTTP daemon on :3100.
+//! map-launcher tile-server — the desktop app twin of the headless server.
 //!
-//! Routes (consumed by the Next.js preview UI through the gateway):
-//!   GET /                     -> service banner JSON
-//!   GET /api/health           -> {ok:true}
-//!   GET /api/stats            -> registry counts + bbox
-//!   GET /api/roads?limit=N    -> roads registry (named first)
-//!   GET /api/roads/{id}       -> road geometry (lon/lat points)
-//!   GET /api/pois?limit=N     -> POI registry
-//!   GET /api/palette          -> parsed openstreetmap-carto palette
-//!   GET /tile/{z}/{x}/{y}.png -> server-side carto-rendered PNG tile
+//! One engine (tile-server-core), two binaries:
+//! - `tile-server`      → this window: a Map tab (tile canvas + the layer
+//!   engine panel, in the spirit of vectorcraft's Layers panel) and a
+//!   Downloads tab (Tanzania region cards, in the spirit of craft-launcher),
+//!   while the HTTP server keeps serving :3100 in the background.
+//! - `tile-server-cli`  → the same engine without a window (`serve`/`extract`).
 //!
-//! Also hosts the `extract` subcommand building the Central-Tanzania store.
+//! Subcommands keep release scripts working: `tile-server serve`, `tile-server
+//! extract <pbf> <outdir> [w s e n]`, `--version`; `--screenshot <dir>` renders
+//! both tabs headlessly (xvfb) for the versioned screenshots folder.
 
-use carto_core::{road_class_name, Line, Store};
-use carto_math::{lonlat_to_merc, tile_bbox, ClipRect};
-use carto_style::{Palette, SymbolRegistry};
-use fontdue::{Font, FontSettings};
-use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-/* --------------------------------------------------------------------- */
-/* Application state                                                       */
-/* --------------------------------------------------------------------- */
+use carto_math::{lonlat_to_merc, merc_to_lonlat, world_px};
+use eframe::egui;
+use egui::{Align2, Color32, ColorImage, CornerRadius, FontId, Frame, Layout, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
+use tile_server_core::layers::{layer_catalog, LayerDef, LayerVis};
+use tile_server_core::download::{pbf_name_for, Manager, Phase, Region, RegionReq};
+use tile_server_core::{load_stack, render_tile_pixmap, spawn_server, App, ServerHandle};
 
-type TileKey = (u8, u32, u32);
-
-struct TileCache {
-    map: HashMap<TileKey, Arc<Vec<u8>>>,
-    order: VecDeque<TileKey>,
-    cap: usize,
-}
-
-impl TileCache {
-    fn new(cap: usize) -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new(), cap }
+fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("tile-server {}", tile_server_core::VERSION);
+        return Ok(());
     }
-    fn get(&mut self, k: &TileKey) -> Option<Arc<Vec<u8>>> {
-        self.map.get(k).cloned()
+    if let Some(pos) = args.iter().position(|a| a == "extract") {
+        let rest: Vec<String> = args[pos + 1..].to_vec();
+        std::process::exit(tile_server_core::run_extract(&rest));
     }
-    fn put(&mut self, k: TileKey, v: Arc<Vec<u8>>) {
-        if self.map.contains_key(&k) {
-            return;
-        }
-        if self.map.len() >= self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
-            }
-        }
-        self.map.insert(k, v);
-        self.order.push_back(k);
-    }
-}
-
-struct App {
-    store: Store,
-    palette: Palette,
-    font: Font,
-    font_bold: Font,
-    #[allow(dead_code)]
-    symbol_count: usize,
-    cache: Mutex<TileCache>,
-    hits: AtomicUsize,
-    misses: AtomicUsize,
-}
-
-/* --------------------------------------------------------------------- */
-/* JSON DTOs (frontend contract)                                           */
-/* --------------------------------------------------------------------- */
-
-#[derive(Serialize)]
-struct StatsDto {
-    roads: usize,
-    named_roads: usize,
-    railways: usize,
-    waterways: usize,
-    water_areas: usize,
-    landuse: usize,
-    buildings: usize,
-    pois: usize,
-    bounds: [f64; 4],
-}
-
-#[derive(Serialize)]
-struct RoadSummaryDto {
-    id: i64,
-    name: String,
-    class: String,
-    length_m: f32,
-    bbox: [f32; 4],
-    named: bool,
-    oneway: u8,
-    lanes: u8,
-    maxspeed: u16,
-}
-
-#[derive(Serialize)]
-struct RoadsRespDto {
-    count: usize,
-    roads: Vec<RoadSummaryDto>,
-}
-
-#[derive(Serialize)]
-struct RoadDetailDto {
-    id: i64,
-    name: String,
-    class: String,
-    length_m: f32,
-    oneway: u8,
-    lanes: u8,
-    maxspeed: u16,
-    points: Vec<[f64; 2]>,
-}
-
-#[derive(Serialize)]
-struct PoiDto {
-    id: i64,
-    name: String,
-    category: String,
-    lat: f64,
-    lon: f64,
-}
-
-#[derive(Serialize)]
-struct PoisRespDto {
-    count: usize,
-    pois: Vec<PoiDto>,
-}
-
-#[derive(Serialize)]
-struct PaletteRoleDto {
-    role: String,
-    var: String,
-    hex: String,
-    rgba: Vec<u8>,
-    source: String,
-}
-
-#[derive(Serialize)]
-struct PaletteRespDto {
-    var_count: usize,
-    color_count: usize,
-    roles: Vec<PaletteRoleDto>,
-}
-
-fn road_line_to_dto(l: &Line) -> RoadSummaryDto {
-    RoadSummaryDto {
-        id: l.id,
-        name: l.name.clone(),
-        class: road_class_name(l.class).to_string(),
-        length_m: l.length_m,
-        bbox: l.bbox,
-        named: !l.name.is_empty(),
-        oneway: l.oneway,
-        lanes: l.lanes,
-        maxspeed: l.maxspeed,
-    }
-}
-
-/* --------------------------------------------------------------------- */
-/* Rendering                                                               */
-/* --------------------------------------------------------------------- */
-
-/// Minimum zoom at which each road class appears.
-fn class_min_zoom(class: u8) -> u8 {
-    match class {
-        0 => 5,   // motorway
-        1 => 12,  // motorway_link
-        2 => 7,   // trunk
-        3 => 12,  // trunk_link
-        4 => 8,   // primary
-        5 => 13,  // primary_link
-        6 => 10,  // secondary
-        7 => 13,  // secondary_link
-        8 => 11,  // tertiary
-        9 | 10 => 12,   // residential, unclassified
-        11 | 12 => 13,  // living_street, pedestrian
-        13 => 14, // service
-        14 => 13, // track
-        15 | 16 | 17 => 14, // footway, path, cycleway
-        18 => 15, // steps
-        _ => 9,   // rail
-    }
-}
-
-/// Stroke width in pixels per class/zoom (roads.mss inspired ramp).
-/// Index 0 = z7, last = z19; clamped at both ends so deep zooms keep widening.
-fn road_width(class: u8, z: u8) -> f32 {
-    let t = |z: u8, vals: [f32; 13]| -> f32 {
-        let i = (z.saturating_sub(7) as usize).min(12);
-        vals[i]
-    };
-    match class {
-        0 => t(z, [0.0, 0.0, 1.5, 2.0, 2.4, 2.8, 3.5, 5.0, 6.5, 9.0, 11.0, 13.5, 16.0]),
-        2 => t(z, [0.0, 0.0, 1.0, 1.6, 2.0, 2.4, 3.0, 4.4, 5.5, 8.0, 9.5, 11.5, 14.0]),
-        4 => t(z, [0.0, 0.0, 0.0, 1.2, 1.6, 2.0, 2.6, 3.8, 5.0, 7.0, 8.5, 10.5, 12.5]),
-        6 => t(z, [0.0, 0.0, 0.0, 0.0, 1.2, 1.6, 2.2, 3.2, 4.2, 6.0, 7.5, 9.0, 11.0]),
-        8 => t(z, [0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 2.0, 2.8, 3.6, 5.5, 6.5, 8.0, 9.5]),
-        9 | 10 => t(z, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.8, 2.4, 3.2, 4.8, 5.8, 7.0, 8.5]),
-        11 | 12 => t(z, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.2, 3.0, 4.5, 5.5, 6.5, 8.0]),
-        13 => t(z, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-        14 => t(z, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.8, 2.2, 3.2, 4.0, 4.8, 5.8]),
-        15 | 16 | 17 => t(z, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.6, 2.4, 3.0, 3.6, 4.4]),
-        18 => t(z, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.8, 2.4, 3.0, 3.6]),
-        _ => t(z, [0.0, 0.0, 0.0, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]), // rail
-    }
-}
-
-/// One oneway direction marker (openstreetmap-carto `symbols/oneway.svg`:
-/// a small triangle pointing along the way) drawn with tiny-skia.
-fn draw_arrow_marker(pixmap: &mut Pixmap, x: f32, y: f32, ux: f32, uy: f32, color: Color) {
-    let (tip_x, tip_y) = (x + ux * 4.5, y + uy * 4.5);
-    let (base_x, base_y) = (x - ux * 3.5, y - uy * 3.5);
-    let (ppx, ppy) = (-uy, ux); // perpendicular
-    let mut pb = PathBuilder::new();
-    pb.move_to(tip_x, tip_y);
-    pb.line_to(base_x + ppx * 3.4, base_y + ppy * 3.4);
-    pb.line_to(base_x - ppx * 3.4, base_y - ppy * 3.4);
-    pb.close();
-    if let Some(path) = pb.finish() {
-        let paint = Paint { shader: tiny_skia::Shader::SolidColor(color), anti_alias: true, ..Default::default() };
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
-    }
-}
-
-/// oneway arrows every 180px along the road (roads.mss `::directions`,
-/// marker-placement: line / marker-spacing: 180; flipped for oneway = -1).
-fn draw_oneway_arrows(
-    pixmap: &mut Pixmap,
-    pts_px: &[(f32, f32)],
-    color: Color,
-    reverse: bool,
-) {
-    const SPACING: f32 = 180.0;
-    let dir = f64::from(if reverse { -1.0 } else { 1.0 });
-    let mut next = SPACING / 2.0;
-    let mut acc = 0.0f32;
-    let mut placed = 0usize;
-    for w in pts_px.windows(2) {
-        let (x1, y1) = w[0];
-        let (x2, y2) = w[1];
-        let (dx, dy) = (x2 - x1, y2 - y1);
-        let seg = (dx * dx + dy * dy).sqrt();
-        if seg < 1e-6 {
-            continue;
-        }
-        while next <= acc + seg {
-            let t = (next - acc) / seg;
-            let (px, py) = (x1 + dx * t, y1 + dy * t);
-            if (-8.0..=264.0).contains(&px) && (-8.0..=264.0).contains(&py) {
-                let (ux, uy) = (dx / seg * dir as f32, dy / seg * dir as f32);
-                draw_arrow_marker(pixmap, px, py, ux, uy, color);
-                placed += 1;
-                if placed >= 24 {
-                    return;
+    if let Some(pos) = args.iter().position(|a| a == "serve" || a == "--headless") {
+        let mut port: u16 = 3100;
+        let mut data_flag: Option<String> = None;
+        let mut i = pos + 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--port" if i + 1 < args.len() => {
+                    port = args[i + 1].parse().unwrap_or(3100);
+                    i += 2;
                 }
-            }
-            next += SPACING;
-        }
-        acc += seg;
-    }
-}
-
-/// Per-class oneway arrow colour: roads.mss `@*-oneway-arrow-color`
-/// (darken(casing, 10-40%) per class); None = class gets no arrows.
-fn oneway_arrow_color(app: &App, class: u8) -> Option<carto_style::Rgba> {
-    let (var, pct) = match road_class_name(class) {
-        "motorway" | "motorway_link" => ("motorway-casing", 25.0),
-        "trunk" | "trunk_link" => ("trunk-casing", 25.0),
-        "primary" | "primary_link" => ("primary-casing", 15.0),
-        "secondary" | "secondary_link" => ("secondary-casing", 10.0),
-        "tertiary" => ("tertiary-casing", 30.0),
-        "residential" | "unclassified" | "service" => ("residential-casing", 40.0),
-        "living_street" => ("residential-casing", 30.0),
-        "pedestrian" => ("pedestrian-casing", 25.0),
-        _ => return None,
-    };
-    app.palette.get(var).map(|c| carto_style::darken(c, pct))
-}
-
-fn skia_color(c: carto_style::Rgba, alpha_mul: f32) -> Color {
-    Color::from_rgba(
-        f32::from(c.r) / 255.0,
-        f32::from(c.g) / 255.0,
-        f32::from(c.b) / 255.0,
-        (f32::from(c.a) / 255.0 * alpha_mul).clamp(0.0, 1.0),
-    )
-    .unwrap_or(Color::from_rgba8(0, 0, 0, 255))
-}
-
-fn draw_line(
-    pixmap: &mut Pixmap,
-    pts_px: &[(f32, f32)],
-    width: f32,
-    color: Color,
-    clip_px: &ClipRect,
-) {
-    if pts_px.len() < 2 || width <= 0.0 {
-        return;
-    }
-    let pad = width + 2.0;
-    let _ = pad;
-    let mut pb = PathBuilder::new();
-    let mut drawing = false;
-    for w in pts_px.windows(2) {
-        if let Some((x1, y1, x2, y2)) = clip_px.clip_line(
-            f64::from(w[0].0),
-            f64::from(w[0].1),
-            f64::from(w[1].0),
-            f64::from(w[1].1),
-        ) {
-            if !drawing {
-                pb.move_to(x1 as f32, y1 as f32);
-                drawing = true;
-            }
-            pb.line_to(x2 as f32, y2 as f32);
-        } else {
-            drawing = false;
-        }
-    }
-    if let Some(path) = pb.finish() {
-        let paint = Paint { shader: tiny_skia::Shader::SolidColor(color), anti_alias: true, ..Default::default() };
-        let st = Stroke { width: width.max(0.4), line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
-        pixmap.stroke_path(&path, &paint, &st, Transform::identity(), None);
-    }
-}
-
-fn draw_polygon(pixmap: &mut Pixmap, ring_px: &[(f32, f32)], color: Color, clip_px: &ClipRect) {
-    if ring_px.len() < 3 {
-        return;
-    }
-    let flat: Vec<f64> = ring_px.iter().flat_map(|p| [f64::from(p.0), f64::from(p.1)]).collect();
-    let clipped = clip_px.clip_polygon(&flat);
-    if clipped.len() < 6 {
-        return;
-    }
-    let mut pb = PathBuilder::new();
-    pb.move_to(clipped[0] as f32, clipped[1] as f32);
-    for v in clipped[2..].chunks(2) {
-        pb.line_to(v[0] as f32, v[1] as f32);
-    }
-    pb.close();
-    if let Some(path) = pb.finish() {
-        let paint = Paint { shader: tiny_skia::Shader::SolidColor(color), anti_alias: true, ..Default::default() };
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
-    }
-}
-
-/// Blend one coverage bitmap onto the pixmap (premultiplied math).
-fn blit_coverage(pixmap: &mut Pixmap, bmp: &[u8], w: usize, h: usize, ox: i32, oy: i32, col: (u8, u8, u8), alpha: u8) {
-    let (pw, ph) = (pixmap.width() as usize, pixmap.height() as usize);
-    let data = pixmap.data_mut();
-    for row in 0..h {
-        let py = oy + row as i32;
-        if py < 0 || py >= ph as i32 {
-            continue;
-        }
-        for cx in 0..w {
-            let cov = bmp[row * w + cx] as u32;
-            if cov == 0 {
-                continue;
-            }
-            let px = ox + cx as i32;
-            if px < 0 || px >= pw as i32 {
-                continue;
-            }
-            let a = (cov * alpha as u32) / 255;
-            if a == 0 {
-                continue;
-            }
-            let i = (py as usize * pw + px as usize) * 4;
-            let af = a as f32 / 255.0;
-            let inv = 1.0 - af;
-            // src premultiplied
-            let sr = col.0 as f32 * af;
-            let sg = col.1 as f32 * af;
-            let sb = col.2 as f32 * af;
-            data[i] = (sr + data[i] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            data[i + 1] = (sg + data[i + 1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            data[i + 2] = (sb + data[i + 2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            data[i + 3] = (a as f32 + data[i + 3] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-        }
-    }
-}
-
-/// Draw text centered at (cx, baseline) with optional halo.
-fn draw_text(
-    pixmap: &mut Pixmap,
-    font: &Font,
-    text: &str,
-    cx: f32,
-    baseline: f32,
-    size: f32,
-    color: (u8, u8, u8),
-    halo: Option<(u8, u8, u8)>,
-    clip_px: &ClipRect,
-) {
-    if text.is_empty() {
-        return;
-    }
-    // Quick reject: text bbox (approx by advance) outside clip.
-    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::new();
-    let mut total_w = 0f32;
-    for ch in text.chars() {
-        let (m, bmp) = font.rasterize(ch, size);
-        total_w += m.advance_width;
-        glyphs.push((m, bmp));
-    }
-    let mut pen = cx - total_w / 2.0;
-    let put = |pixmap: &mut Pixmap, pen: f32, col: (u8, u8, u8), alpha: u8| {
-        let mut x = pen;
-        for (m, bmp) in &glyphs {
-            let ox = (x + m.xmin as f32).round() as i32;
-            let oy = (baseline - (m.ymin as f32 + m.height as f32)).round() as i32;
-            if !bmp.is_empty() {
-                blit_coverage(pixmap, bmp, m.width, m.height, ox, oy, col, alpha);
-            }
-            x += m.advance_width;
-        }
-    };
-    if let Some(hc) = halo {
-        for &(dx, _dy) in &[
-            (-1.0, 0.0),
-            (1.0, 0.0),
-            (0.0, -1.0),
-            (0.0, 1.0),
-            (-1.0, -1.0),
-            (1.0, -1.0),
-            (-1.0, 1.0),
-            (1.0, 1.0),
-        ] {
-            put(pixmap, pen + dx, hc, 200);
-        }
-    }
-    let _ = clip_px; // glyphs are small; blit clips per-pixel already
-    put(pixmap, pen, color, 255);
-    let _ = &mut pen;
-}
-
-/// Render one 256px carto tile to PNG bytes.
-fn render_tile(app: &App, z: u8, x: u32, y: u32) -> Option<Vec<u8>> {
-    let mut pixmap = Pixmap::new(256, 256)?;
-    let land = app.palette.get("land-color").unwrap_or(carto_style::Rgba::rgb(0xf2, 0xef, 0xe9));
-    pixmap.fill(skia_color(land, 1.0));
-
-    let [w, s, e, n] = tile_bbox(z, x, y);
-    let (tw, ts, te, tn) = (w as f32, s as f32, e as f32, n as f32);
-    let clip = ClipRect::new(-40.0, -40.0, 296.0, 296.0);
-
-    // lon/lat -> tile-local px
-    let scale = carto_math::world_px(z);
-    let ox = f64::from(x) * 256.0;
-    let oy = f64::from(y) * 256.0;
-    let store = &app.store;
-    let project = |i: u32| -> (f32, f32) {
-        let (mx, my) = lonlat_to_merc(f64::from(store.lon[i as usize]), f64::from(store.lat[i as usize]));
-        ((mx * scale - ox) as f32, (my * scale - oy) as f32)
-    };
-    let in_tile = |b: &[f32; 4]| b[2] >= tw && b[0] <= te && b[3] >= ts && b[1] <= tn;
-
-    let line_px = |pts: &Vec<u32>| -> Vec<(f32, f32)> { pts.iter().map(|&i| project(i)).collect() };
-
-    /* ---- landuse polygons ---- */
-    let lu_colors: &[(&str, &str)] = &[        ("forest", "forest"),
-        ("farmland", "farmland"),
-        ("farmyard", "farmyard"),
-        ("grass", "grass"),
-        ("park", "park"),
-        ("garden", "park"),
-        ("pitch", "grass"),
-        ("golf_course", "grass"),
-        ("playground", "grass"),
-        ("orchard", "orchard"),
-        ("allotments", "allotments"),
-        ("scrub", "scrub"),
-        ("residential", "residential"),
-        ("retail", "retail"),
-        ("commercial", "commercial"),
-        ("industrial", "industrial"),
-        ("school", "residential"),
-        ("hospital", "residential"),
-        ("college", "residential"),
-        ("university", "residential"),
-        ("place_of_worship", "residential"),
-        ("marketplace", "retail"),
-        ("sand", "farmland"),
-        ("beach", "farmland"),
-    ];
-    for a in &store.landuse {
-        if z < 8 || !in_tile(&a.bbox) {
-            continue;
-        }
-        let is_major = matches!(a.kind.as_str(), "forest" | "farmland" | "scrub");
-        if z < 10 && !is_major {
-            continue;
-        }
-        let var = lu_colors.iter().find(|(k, _)| *k == a.kind).map(|(_, v)| *v);
-        let Some(var) = var else { continue };
-        let Some(c) = app.palette.get(var) else { continue };
-        let ring = line_px(&a.pts);
-        if ring.len() >= 3 {
-            draw_polygon(&mut pixmap, &ring, skia_color(c, 1.0), &clip);
-        }
-    }
-
-    /* ---- water areas ---- */
-    if z >= 7 {
-        let wc = app.palette.get("water-color").unwrap_or(carto_style::Rgba::rgb(0xaa, 0xd3, 0xdf));
-        for a in &store.water_areas {
-            if in_tile(&a.bbox) {
-                let ring = line_px(&a.pts);
-                if ring.len() >= 3 {
-                    draw_polygon(&mut pixmap, &ring, skia_color(wc, 1.0), &clip);
+                "--data-dir" if i + 1 < args.len() => {
+                    data_flag = Some(args[i + 1].clone());
+                    i += 2;
                 }
+                _ => i += 1,
             }
         }
+        std::process::exit(tile_server_core::run_headless(port, data_flag));
     }
 
-    /* ---- waterways ---- */
-    if z >= 8 {
-        let wc = app.palette.get("water-color").unwrap_or(carto_style::Rgba::rgb(0xaa, 0xd3, 0xdf));
-        let width = match z {
-            8 => 0.7,
-            9 => 1.2,
-            10 => 1.5,
-            11 => 1.8,
-            12 => 2.3,
-            13 => 3.0,
-            14 => 3.5,
-            15 => 4.5,
-            _ => 6.0,
-        };
-        for wway in &store.waterways {
-            if !in_tile(&wway.bbox) {
-                continue;
-            }
-            draw_line(&mut pixmap, &line_px(&wway.pts), width, skia_color(wc, 1.0), &clip);
-        }
-    }
-
-    /* ---- buildings ---- */
-    if z >= 13 {
-        let bf = app.palette.get("building-fill").unwrap_or(carto_style::Rgba::rgb(0xd9, 0xd0, 0xc9));
-        for b in &store.buildings {
-            if in_tile(&b.bbox) {
-                let ring = line_px(&b.pts);
-                if ring.len() >= 3 {
-                    draw_polygon(&mut pixmap, &ring, skia_color(bf, 1.0), &clip);
-                }
-            }
-        }
-        if z >= 15 {
-            let bl = app.palette.get("building-line").unwrap_or(carto_style::Rgba::rgb(0xbc, 0xb3, 0xaa));
-            for b in &store.buildings {
-                if in_tile(&b.bbox) {
-                    let ring = line_px(&b.pts);
-                    if ring.len() >= 3 {
-                        draw_polygon(&mut pixmap, &ring, skia_color(bl, 0.6), &clip);
-                    }
-                }
-            }
-        }
-    }
-
-    /* ---- railways (casing) ---- */
-    if z >= 9 {
-        let rc = carto_style::Rgba::rgb(0x8a, 0x8a, 0x8a);
-        let width = match z {
-            9 | 10 => 0.9,
-            11 | 12 => 1.4,
-            13 | 14 => 2.0,
-            _ => 2.6,
-        };
-        for r in &store.railways {
-            if in_tile(&r.bbox) {
-                draw_line(&mut pixmap, &line_px(&r.pts), width, skia_color(rc, 1.0), &clip);
-            }
-        }
-    }
-
-    /* ---- roads: casings then fills ---- */
-    let casing_for = |class: u8| -> carto_style::Rgba {
-        let name = road_class_name(class);
-        let var = match name {
-            "motorway" | "motorway_link" => "motorway-casing",
-            "trunk" | "trunk_link" => "trunk-casing",
-            "primary" | "primary_link" => "primary-casing",
-            "secondary" | "secondary_link" => "secondary-casing",
-            "tertiary" => "tertiary-casing",
-            "residential" | "unclassified" | "service" => "residential-casing",
-            "living_street" | "pedestrian" => "residential-casing",
-            "track" => "default-casing",
-            "footway" | "path" | "cycleway" | "steps" => "default-casing",
-            _ => "default-casing",
-        };
-        app.palette.get(var).unwrap_or(carto_style::Rgba::rgb(255, 255, 255))
-    };
-    let fill_for = |app: &App, class: u8, z: u8| -> carto_style::Rgba {
-        let name = road_class_name(class);
-        let low = |base: &str, lowzoom: &str| {
-            if z <= 11 {
-                app.palette.get(lowzoom).or_else(|| app.palette.get(base)).unwrap()
-            } else {
-                app.palette.get(base).unwrap()
-            }
-        };
-        match name {
-            "motorway" | "motorway_link" => low("motorway-fill", "motorway-low-zoom"),
-            "trunk" | "trunk_link" => low("trunk-fill", "trunk-low-zoom"),
-            "primary" | "primary_link" => low("primary-fill", "primary-low-zoom"),
-            "secondary" | "secondary_link" => low("secondary-fill", "secondary-low-zoom"),
-            "tertiary" => app.palette.get("tertiary-fill").unwrap(),
-            "residential" | "unclassified" => app.palette.get("residential-fill").unwrap(),
-            "living_street" => app.palette.get("living-street-fill").unwrap(),
-            "pedestrian" => app.palette.get("pedestrian-fill").unwrap(),
-            "service" => app.palette.get("residential-fill").unwrap(),
-            "track" => app.palette.get("track-fill").unwrap(),
-            "footway" | "path" | "cycleway" | "steps" => app.palette.get("footway-fill").unwrap(),
-            _ => carto_style::Rgba::rgb(0xdd, 0xdd, 0xdd),
-        }
-    };
-
-    let mut labeled: Vec<(&Line, Vec<(f32, f32)>)> = Vec::new();
-    let show_casing = z >= 12;
-    // casings
-    if show_casing {
-        for r in &store.roads {
-            let width = road_width(r.class, z);
-            if width <= 0.0 || !in_tile(&r.bbox) {
-                continue;
-            }
-            let c = casing_for(r.class);
-            let cw = width + if width >= 4.0 { 2.0 } else { 1.2 };
-            draw_line(&mut pixmap, &line_px(&r.pts), cw, skia_color(c, 1.0), &clip);
-        }
-    }
-    // fills
-    for r in &store.roads {
-        let width = road_width(r.class, z);
-        if width <= 0.0 || !in_tile(&r.bbox) || z < class_min_zoom(r.class) {
-            continue;
-        }
-        let pts = line_px(&r.pts);
-        let c = fill_for(app, r.class, z);
-        draw_line(&mut pixmap, &pts, width, skia_color(c, 1.0), &clip);
-        // ::directions — oneway arrows from z16 (roads.mss), under the labels
-        if z >= 16 && r.oneway != 0 && width >= 1.4 {
-            if let Some(ac) = oneway_arrow_color(app, r.class) {
-                draw_oneway_arrows(&mut pixmap, &pts, skia_color(ac, 1.0), r.oneway == 2);
-            }
-        }
-        let label_cap = 24 + usize::from(z.saturating_sub(14)) * 12;
-        if z >= 13 && !r.name.is_empty() && width >= 1.8 && labeled.len() < label_cap {
-            labeled.push((r, pts));
-        }
-    }
-
-    /* ---- road labels ---- */
-    if z >= 13 && !labeled.is_empty() {
-        let mut used: HashSet<(u16, u16)> = HashSet::new();
-        let size = if z >= 15 { 11.0 } else { 10.0 };
-        let fnt: &Font = if z >= 15 { &app.font_bold } else { &app.font };
-        let shield = |class: u8| -> (u8, u8, u8) {
-            let c = match road_class_name(class) {
-                "motorway" | "motorway_link" => app.palette.get("motorway-shield"),
-                "trunk" | "trunk_link" => app.palette.get("trunk-shield"),
-                "primary" | "primary_link" => app.palette.get("primary-shield"),
-                "secondary" | "secondary_link" => app.palette.get("secondary-shield"),
-                "tertiary" => app.palette.get("tertiary-shield"),
-                _ => None,
-            };
-            c.map(|x| (x.r, x.g, x.b)).unwrap_or((0x3b, 0x3b, 0x3b))
-        };
-        for (r, pts) in &labeled {
-            // label at the middle vertex
-            let mid = pts[pts.len() / 2];
-            let gx = (mid.0 / 48.0) as u16;
-            let gy = (mid.1 / 48.0) as u16;
-            if !used.insert((gx, gy)) {
-                continue;
-            }
-            if mid.0 < 8.0 || mid.0 > 248.0 || mid.1 < 8.0 || mid.1 > 248.0 {
-                continue;
-            }
-            let halo = app.palette.get("default-casing").map(|c| (c.r, c.g, c.b)).unwrap_or((255, 255, 255));
-            draw_text(
-                &mut pixmap,
-                fnt,
-                &r.name,
-                mid.0,
-                mid.1 + size / 3.0,
-                size,
-                shield(r.class),
-                Some(halo),
-                &clip,
-            );
-        }
-    }
-
-    /* ---- POI dots + labels ---- */
-    if z >= 14 {
-        let accent = app.palette.get("motorway-casing").unwrap_or(carto_style::Rgba::rgb(0xdc, 0x2a, 0x67));
-        let mut count = 0;
-        for p in &store.pois {
-            let (lon, lat) = (f64::from(store.lon[p.idx as usize]), f64::from(store.lat[p.idx as usize]));
-            if lon < f64::from(tw) || lon > f64::from(te) || lat < f64::from(ts) || lat > f64::from(tn) {
-                continue;
-            }
-            let (px, py) = {
-                let (mx, my) = lonlat_to_merc(lon, lat);
-                ((mx * scale - ox) as f32, (my * scale - oy) as f32)
-            };
-            if px < 4.0 || px > 252.0 || py < 4.0 || py > 252.0 || count >= 40 {
-                continue;
-            }
-            count += 1;
-            let mut pb = PathBuilder::new();
-            pb.push_circle(px, py, 2.4);
-            if let Some(path) = pb.finish() {
-                let paint = Paint { shader: tiny_skia::Shader::SolidColor(skia_color(accent, 1.0)), anti_alias: true, ..Default::default() };
-                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
-                let paint_w = Paint { shader: tiny_skia::Shader::SolidColor(Color::from_rgba8(255, 255, 255, 220)), anti_alias: true, ..Default::default() };
-                let mut pbc = PathBuilder::new();
-                pbc.push_circle(px, py, 2.4);
-                if let Some(ring) = pbc.finish() {
-                    pixmap.stroke_path(&ring, &paint_w, &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
-                }
-            }
-            if z >= 16 {
-                draw_text(
-                    &mut pixmap,
-                    &app.font,
-                    &p.name,
-                    px,
-                    py - 5.0,
-                    9.0,
-                    (0x2c, 0x2c, 0x2c),
-                    Some((255, 255, 255)),
-                    &clip,
-                );
-            }
-        }
-    }
-
-    pixmap.encode_png().ok().map(|v| v.to_vec())
-}
-
-/* --------------------------------------------------------------------- */
-/* HTTP plumbing                                                           */
-/* --------------------------------------------------------------------- */
-
-struct Response {
-    status: u16,
-    content_type: &'static str,
-    body: Vec<u8>,
-    cache_hdr: Option<&'static str>,
-}
-
-impl Response {
-    fn json(status: u16, body: String) -> Response {
-        Response { status, content_type: "application/json; charset=utf-8", body: body.into_bytes(), cache_hdr: None }
-    }
-    fn png(body: Vec<u8>) -> Response {
-        Response { status: 200, content_type: "image/png", body, cache_hdr: Some("public, max-age=86400") }
-    }
-    fn not_found(msg: &str) -> Response {
-        Response::json(404, format!("{{\"error\":\"{msg}\"}}"))
-    }
-}
-
-fn write_response(stream: &mut TcpStream, resp: &Response, keep_alive: bool) -> std::io::Result<()> {
-    let reason = match resp.status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
-    let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
-        resp.status,
-        reason,
-        resp.content_type,
-        resp.body.len()
-    );
-    if let Some(c) = resp.cache_hdr {
-        head.push_str(&format!("Cache-Control: {c}\r\n"));
-    }
-    head.push_str(if keep_alive {
-        "Connection: keep-alive\r\n\r\n"
-    } else {
-        "Connection: close\r\n\r\n"
-    });
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(&resp.body)?;
-    stream.flush()
-}
-
-fn handle_client(stream: TcpStream, app: Arc<App>) {
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
-    let mut writer = match stream.try_clone() {
-        Ok(w) => w,
-        Err(_) => return,
-    };
-    let mut reader = BufReader::new(stream);
-
-    loop {
-        // Request line + headers
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
-        }
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or("");
-        let target = parts.next().unwrap_or("");
-        let version = parts.next().unwrap_or("HTTP/1.1");
-        if method != "GET" {
-            let _ = write_response(&mut writer, &Response::not_found("method not allowed"), false);
-            return;
-        }
-        // Drain headers (discard Content-Length bodies just in case).
-        let mut content_length = 0usize;
-        loop {
-            let mut h = String::new();
-            if reader.read_line(&mut h).unwrap_or(0) == 0 {
-                return;
-            }
-            let h = h.trim();
-            if h.is_empty() {
-                break;
-            }
-            let lower = h.to_ascii_lowercase();
-            if let Some(v) = lower.strip_prefix("content-length:") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
-        }
-        if content_length > 0 {
-            let mut sink = vec![0u8; content_length.min(1 << 20)];
-            let _ = reader.read_exact(&mut sink);
-        }
-
-        let (path, query) = match target.split_once('?') {
-            Some((p, q)) => (p.to_string(), q.to_string()),
-            None => (target.to_string(), String::new()),
-        };
-        let qp: HashMap<&str, &str> = query
-            .split('&')
-            .filter_map(|kv| kv.split_once('='))
-            .collect();
-        let keep_alive = version != "HTTP/1.0"
-            && !qp.get("Connection").map(|c| c.eq_ignore_ascii_case("close")).unwrap_or(false);
-
-        let resp = route(&app, &path, &qp);
-        if write_response(&mut writer, &resp, keep_alive).is_err() {
-            return;
-        }
-        if !keep_alive {
-            return;
-        }
-    }
-}
-
-fn route(app: &App, path: &str, qp: &HashMap<&str, &str>) -> Response {
-    match path {
-        "/" => Response::json(
-            200,
-            "{\"ok\":true,\"service\":\"map-launcher tile-server\",\"version\":\"0.3.0\"}".to_string(),
-        ),
-        "/api/health" => Response::json(200, "{\"ok\":true}".to_string()),
-        "/api/stats" => {
-            let named = app.store.roads.iter().filter(|r| !r.name.is_empty()).count();
-            let dto = StatsDto {
-                roads: app.store.roads.len(),
-                named_roads: named,
-                railways: app.store.railways.len(),
-                waterways: app.store.waterways.len(),
-                water_areas: app.store.water_areas.len(),
-                landuse: app.store.landuse.len(),
-                buildings: app.store.buildings.len(),
-                pois: app.store.pois.len(),
-                bounds: app.store.bbox,
-            };
-            Response::json(200, serde_json::to_string(&dto).unwrap_or_default())
-        }
-        "/api/roads" => {
-            let limit: usize = qp.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50_000).min(200_000);
-            let roads: Vec<RoadSummaryDto> =
-                app.store.roads.iter().take(limit).map(road_line_to_dto).collect();
-            let dto = RoadsRespDto { count: roads.len(), roads };
-            Response::json(200, serde_json::to_string(&dto).unwrap_or_default())
-        }
-        "/api/pois" => {
-            let limit: usize = qp.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20_000).min(100_000);
-            let pois: Vec<PoiDto> = app
-                .store
-                .pois
-                .iter()
-                .take(limit)
-                .map(|p| PoiDto {
-                    id: p.id,
-                    name: p.name.clone(),
-                    category: p.category.clone(),
-                    lat: f64::from(app.store.lat[p.idx as usize]),
-                    lon: f64::from(app.store.lon[p.idx as usize]),
-                })
-                .collect();
-            let dto = PoisRespDto { count: pois.len(), pois };
-            Response::json(200, serde_json::to_string(&dto).unwrap_or_default())
-        }
-        "/api/palette" => {
-            let roles: Vec<PaletteRoleDto> = app
-                .palette
-                .roles
-                .iter()
-                .map(|r| {
-                    let (rr, gg, bb, aa) = r.color.rgba_tuple();
-                    PaletteRoleDto {
-                        role: r.role.clone(),
-                        var: r.var.clone(),
-                        hex: r.color.hex(),
-                        rgba: if aa == 255 { vec![rr, gg, bb] } else { vec![rr, gg, bb, aa] },
-                        source: r.source.clone(),
-                    }
-                })
-                .collect();
-            let dto = PaletteRespDto {
-                var_count: app.palette.var_count(),
-                color_count: app.palette.color_count,
-                roles,
-            };
-            Response::json(200, serde_json::to_string(&dto).unwrap_or_default())
-        }
-        _ => {
-            if let Some(rest) = path.strip_prefix("/api/roads/") {
-                let id: i64 = match rest.parse() {
-                    Ok(v) => v,
-                    Err(_) => return Response::not_found("invalid road id"),
-                };
-                let r = app.store.roads.iter().find(|r| r.id == id);
-                return match r {
-                    Some(r) => {
-                        let points: Vec<[f64; 2]> = r
-                            .pts
-                            .iter()
-                            .map(|&i| {
-                                [
-                                    f64::from(app.store.lon[i as usize]),
-                                    f64::from(app.store.lat[i as usize]),
-                                ]
-                            })
-                            .collect();
-                        let dto = RoadDetailDto {
-                            id: r.id,
-                            name: r.name.clone(),
-                            class: road_class_name(r.class).to_string(),
-                            length_m: r.length_m,
-                            oneway: r.oneway,
-                            lanes: r.lanes,
-                            maxspeed: r.maxspeed,
-                            points,
-                        };
-                        Response::json(200, serde_json::to_string(&dto).unwrap_or_default())
-                    }
-                    None => Response::not_found("road not found"),
-                };
-            }
-            if let Some(rest) = path.strip_prefix("/tile/") {
-                return tile_route(app, rest);
-            }
-            Response::not_found("no such route")
-        }
-    }
-}
-
-fn tile_route(app: &App, rest: &str) -> Response {
-    let rest = rest.strip_suffix(".png").unwrap_or(rest);
-    let segs: Vec<&str> = rest.split('/').collect();
-    if segs.len() != 3 {
-        return Response::not_found("bad tile path");
-    }
-    let (z, x, y): (u8, u32, u32) = match (segs[0].parse(), segs[1].parse(), segs[2].parse()) {
-        (Ok(z), Ok(x), Ok(y)) => (z, x, y),
-        _ => return Response::not_found("bad tile coords"),
-    };
-    if z > 19 {
-        return Response::not_found("zoom out of range");
-    }
-    let key: TileKey = (z, x, y);
-    {
-        let mut cache = app.cache.lock().unwrap();
-        if let Some(png) = cache.get(&key) {
-            app.hits.fetch_add(1, Ordering::Relaxed);
-            return Response::png((*png).clone());
-        }
-        app.misses.fetch_add(1, Ordering::Relaxed);
-    }
-    let png = render_tile(app, z, x, y).unwrap_or_else(|| {
-        // 1x1 transparent fallback
-        let pm = Pixmap::new(1, 1).unwrap();
-        pm.encode_png().unwrap().to_vec()
-    });
-    let arc = Arc::new(png);
-    app.cache.lock().unwrap().put(key, arc.clone());
-    Response::png((*arc).clone())
-}
-
-/* --------------------------------------------------------------------- */
-/* CLI                                                                     */
-/* --------------------------------------------------------------------- */
-
-fn abs_root() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-/// Resolve the data directory holding `store.bin` (+ `registry.json`).
-/// Priority: `--data-dir` flag > `MAP_LAUNCHER_DATA` env > `./data` (cwd) >
-/// `<exe dir>/data` > `<exe dir>` (flat release zip layout). The first
-/// candidate that actually contains `store.bin` wins; all searched paths are
-/// reported so a bare release binary tells the user exactly what to fix.
-fn resolve_data_dir(root: &PathBuf, flag: Option<String>) -> (PathBuf, Vec<PathBuf>) {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(d) = flag {
-        candidates.push(PathBuf::from(d));
-    }
-    if let Ok(v) = std::env::var("MAP_LAUNCHER_DATA") {
-        if !v.trim().is_empty() {
-            candidates.push(PathBuf::from(v.trim().to_string()));
-        }
-    }
-    candidates.push(root.join("data"));
-    if let Some(d) = exe_dir {
-        candidates.push(d.join("data"));
-        candidates.push(d);
-    }
-    let mut unique: Vec<PathBuf> = Vec::new();
-    for c in candidates {
-        if !unique.contains(&c) {
-            unique.push(c);
-        }
-    }
-    let chosen = unique
-        .iter()
-        .find(|d| d.join("store.bin").is_file())
-        .cloned()
-        .unwrap_or_else(|| unique.first().cloned().unwrap_or_else(|| root.join("data")));
-    (chosen, unique)
-}
-
-/// Load the label font face: system scan first (craft-launcher style), then
-/// the build-machine bundled assets, then the DejaVu bytes embedded in this
-/// binary — the guaranteed fallback for bare release executables.
-fn load_font_face(bold: bool) -> (Font, String) {
-    let path = carto_style::load_map_font(bold).or_else(|| carto_style::find_font("dejavu", bold));
-    if let Some(p) = path {
-        match std::fs::read(&p) {
-            Ok(bytes) => match Font::from_bytes(bytes, FontSettings { scale: 12.0, ..Default::default() }) {
-                Ok(f) => return (f, p.display().to_string()),
-                Err(e) => eprintln!("font {} parse failed ({e}) — using embedded DejaVu", p.display()),
-            },
-            Err(e) => eprintln!("font {} unreadable ({e}) — using embedded DejaVu", p.display()),
-        }
-    }
-    let (name, bytes) = carto_style::embedded_font("DejaVu Sans", bold)
-        .expect("embedded DejaVu font missing (build corruption)");
-    let font = Font::from_bytes(bytes.to_vec(), FontSettings { scale: 12.0, ..Default::default() })
-        .expect("embedded font parse failed");
-    (font, format!("embedded:{name}"))
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 2 && args[1] == "extract" {
-        // tile-server extract <pbf> <outdir> [w s e n]
-        if args.len() < 4 {
-            eprintln!("usage: tile-server extract <pbf> <outdir> [w s e n]");
-            std::process::exit(2);
-        }
-        let pbf = PathBuf::from(&args[2]);
-        let out = PathBuf::from(&args[3]);
-        let bbox = if args.len() >= 8 {
-            [
-                args[4].parse().unwrap(),
-                args[5].parse().unwrap(),
-                args[6].parse().unwrap(),
-                args[7].parse().unwrap(),
-            ]
-        } else {
-            carto_core::DODOMA_BBOX
-        };
-        eprintln!("extracting {pbf:?} bbox={bbox:?} -> {out:?}");
-        match carto_core::extract(&pbf, &out, bbox) {
-            Ok(store) => {
-                eprintln!(
-                    "done: {} roads / {} buildings / {} pois",
-                    store.roads.len(),
-                    store.buildings.len(),
-                    store.pois.len()
-                );
-            }
-            Err(e) => {
-                eprintln!("extract failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
-    // serve
     let mut port: u16 = 3100;
     let mut data_flag: Option<String> = None;
-    let mut i = 1;
+    let mut screenshot: Option<PathBuf> = None;
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--port" if i + 1 < args.len() => {
@@ -1134,93 +68,1135 @@ fn main() {
                 data_flag = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--screenshot" if i + 1 < args.len() => {
+                screenshot = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
             _ => i += 1,
         }
     }
 
-    let root = abs_root();
-    let assets = root.join("assets");
+    let stack = load_stack(data_flag);
+    stack.log();
+    let app = tile_server_core::app_from_stack(stack);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(format!("map-launcher tile-server {}", tile_server_core::VERSION))
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([980.0, 620.0]),
+        persist_window: false,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "map-launcher tile-server",
+        options,
+        Box::new(move |cc| {
+            theme::install(cc);
+            Ok(Box::new(Shell::new(cc, app.clone(), port, screenshot)))
+        }),
+    )
+}
 
-    // Palette: on-disk assets/style first (dev checkout), else the verbatim
-    // openstreetmap-carto style sheets embedded in this binary.
-    let style_dir = assets.join("style");
-    let (palette, palette_src) = if style_dir.is_dir() {
-        match Palette::from_dir(&style_dir) {
-            Ok(p) => (p, style_dir.display().to_string()),
+/* --------------------------------------------------------------------- */
+/* Theme (craft-launcher tokens, adapted to the map's accent)              */
+/* --------------------------------------------------------------------- */
+
+mod theme {
+    use super::*;
+
+    pub const BG: Color32 = Color32::from_rgb(0x17, 0x18, 0x1a);
+    pub const PANEL: Color32 = Color32::from_rgb(0x1f, 0x21, 0x24);
+    pub const PANEL_2: Color32 = Color32::from_rgb(0x26, 0x29, 0x2d);
+    pub const BORDER: Color32 = Color32::from_rgb(0x33, 0x36, 0x3a);
+    pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe4, 0xe0);
+    pub const DIM: Color32 = Color32::from_rgb(0x9a, 0x98, 0x91);
+    pub const ACCENT: Color32 = Color32::from_rgb(0xdc, 0x2a, 0x67);
+    pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x8e, 0x1d, 0x43);
+    pub const OK: Color32 = Color32::from_rgb(0x4e, 0x9d, 0x55);
+    pub const WARN: Color32 = Color32::from_rgb(0xc7, 0x86, 0x2b);
+    pub const DANGER: Color32 = Color32::from_rgb(0xc3, 0x3b, 0x3b);
+    pub const ROW_SEL: Color32 = Color32::from_rgb(0x33, 0x21, 0x28);
+
+    /// Register the map's font faces as the UI font (system Noto first, the
+    /// embedded DejaVu as the guaranteed fallback) and paint the dark style.
+    pub fn install(cc: &eframe::CreationContext<'_>) {
+        let mut defs = egui::FontDefinitions::default();
+        let reg = carto_style::load_map_font(false)
+            .or_else(|| carto_style::find_font("dejavu", false))
+            .and_then(|p| std::fs::read(p).ok())
+            .or_else(|| carto_style::embedded_font("DejaVu Sans", false).map(|(_, b)| b.to_vec()));
+        let bold = carto_style::load_map_font(true)
+            .or_else(|| carto_style::find_font("dejavu", true))
+            .and_then(|p| std::fs::read(p).ok())
+            .or_else(|| carto_style::embedded_font("DejaVu Sans", true).map(|(_, b)| b.to_vec()));
+        if let Some(bytes) = reg {
+            defs.font_data.insert("map-ui".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            // After egui's defaults: variable system fonts (NotoSansSC[wght])
+            // can rasterise empty glyphs, so they must not lead the family.
+            defs.families.entry(egui::FontFamily::Proportional).or_default().push("map-ui".into());
+        }
+        if let Some(bytes) = bold {
+            defs.font_data.insert("map-ui-bold".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            defs.families.entry(egui::FontFamily::Proportional).or_default().push("map-ui-bold".into());
+        }
+        cc.egui_ctx.set_fonts(defs);
+
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+        let mut v = egui::Visuals::dark();
+        v.panel_fill = PANEL;
+        v.window_fill = PANEL;
+        v.extreme_bg_color = BG;
+        v.faint_bg_color = PANEL_2;
+        v.widgets.noninteractive.bg_fill = PANEL_2;
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.inactive.bg_fill = PANEL_2;
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(0x2e, 0x32, 0x37);
+        v.widgets.hovered.fg_stroke = Stroke::new(1.2, TEXT);
+        v.widgets.active.bg_fill = ACCENT_DIM;
+        v.widgets.active.fg_stroke = Stroke::new(1.2, TEXT);
+        v.selection.bg_fill = ACCENT_DIM;
+        v.selection.stroke = Stroke::new(1.0, TEXT);
+        v.override_text_color = Some(TEXT);
+        cc.egui_ctx.set_visuals_of(egui::Theme::Dark, v);
+        cc.egui_ctx.all_styles_mut(|style| {
+            style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+            style.spacing.button_padding = Vec2::new(10.0, 5.0);
+        });
+    }
+
+    /// A small status pill.
+    pub fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
+        let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(11.5), color);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(galley.size().x + 14.0, 18.0), Sense::hover());
+        ui.painter().rect_filled(rect, CornerRadius::same(9), color.gamma_multiply(0.22));
+        ui.painter().rect_stroke(rect, CornerRadius::same(9), Stroke::new(1.0, color), egui::StrokeKind::Inside);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.5), color);
+    }
+
+    /// The dot used for live statuses.
+    pub fn dot(painter: &egui::Painter, c: Pos2, color: Color32) {
+        painter.circle_filled(c, 4.0, color);
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* Tabs                                                                    */
+/* --------------------------------------------------------------------- */
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Map,
+    Downloads,
+}
+
+fn fmt_bytes(b: u64) -> String {
+    if b >= 1 << 30 {
+        format!("{:.1} GB", b as f64 / (1 << 30) as f64)
+    } else if b >= 1 << 20 {
+        format!("{:.1} MB", b as f64 / (1 << 20) as f64)
+    } else if b >= 1 << 10 {
+        format!("{:.0} KB", b as f64 / (1 << 10) as f64)
+    } else {
+        format!("{b} B")
+    }
+}
+
+/// The screenshot plan for headless captures (`--screenshot <dir>`).
+struct Capture {
+    dir: PathBuf,
+    frames: u32,
+    stage: u32,
+}
+
+struct Shell {
+    app: Arc<App>,
+    tab: Tab,
+    server: Option<ServerHandle>,
+    server_running: bool,
+    port: u16,
+    data_version: Arc<AtomicU64>,
+
+    map: MapState,
+    layers: PanelState,
+    downloads: DownloadsState,
+
+    toast: Option<(String, Instant)>,
+    capture: Option<Capture>,
+}
+
+impl Shell {
+    fn new(cc: &eframe::CreationContext<'_>, app: Arc<App>, port: u16, screenshot: Option<PathBuf>) -> Self {
+        // Auto-start the server: the GUI *is* a tile-server.
+        let (server, server_running) = match spawn_server(port, app.clone()) {
+            Ok(h) => (Some(h), true),
             Err(e) => {
-                eprintln!("palette load from {} failed ({e}) — using embedded openstreetmap-carto style", style_dir.display());
-                (Palette::from_embedded(), "embedded assets/style".to_string())
+                eprintln!("server start failed: {e} (port {port} busy?) — start it from the toolbar");
+                (None, false)
+            }
+        };
+        let bbox = app.store.read().unwrap().bbox;
+        let data_version = Arc::new(AtomicU64::new(1));
+        let map = MapState::new(bbox);
+        let mut shell = Shell {
+            app,
+            tab: Tab::Map,
+            server,
+            server_running,
+            port,
+            data_version: data_version.clone(),
+            map,
+            layers: PanelState::default(),
+            downloads: DownloadsState::new(),
+            toast: None,
+            capture: screenshot.map(|dir| Capture { dir, frames: 0, stage: 0 }),
+        };
+        shell.downloads.data_version = data_version;
+        let _ = cc;
+        shell
+    }
+
+    fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+    }
+}
+
+impl eframe::App for Shell {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Live job polling + auto store swap on completion.
+        self.downloads.poll(ctx, &self.app, &self.data_version);
+
+        // Expire the toast.
+        if let Some((_, at)) = &self.toast {
+            if at.elapsed() >= Duration::from_secs(4) {
+                self.toast = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(250));
             }
         }
-    } else {
-        (Palette::from_embedded(), "embedded assets/style".to_string())
-    };
-    let symbols_dir = assets.join("symbols");
-    let symbol_reg = if symbols_dir.is_dir() {
-        SymbolRegistry::scan(&symbols_dir)
-    } else {
-        SymbolRegistry::embedded()
-    };
-    eprintln!(
-        "palette[{}]: {} vars, {} colors, {} roles, {} symbols",
-        palette_src,
-        palette.var_count(),
-        palette.color_count,
-        palette.roles.len(),
-        symbol_reg.svg_count
-    );
 
-    let (font, font_src) = load_font_face(false);
-    let (font_bold, font_bold_src) = load_font_face(true);
-    eprintln!("fonts: regular={} bold={}", font_src, font_bold_src);
-
-    let (data_dir, searched) = resolve_data_dir(&root, data_flag);
-    let store = Store::load(&data_dir).unwrap_or_else(|e| {
-        eprintln!("store load failed ({e}) — empty registry");
-        eprintln!(
-            "  searched: {}",
-            searched.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
-        );
-        eprintln!("  fix 1: unzip the map-data release asset so store.bin sits in one of those dirs");
-        eprintln!("  fix 2: tile-server extract <pbf> <data-dir> [w s e n]");
-        Store::empty(carto_core::DODOMA_BBOX)
-    });
-    eprintln!(
-        "registry: {} roads ({} named), {} buildings, {} pois, {} landuse, {} waterways",
-        store.roads.len(),
-        store.roads.iter().filter(|r| !r.name.is_empty()).count(),
-        store.buildings.len(),
-        store.pois.len(),
-        store.landuse.len(),
-        store.waterways.len()
-    );
-
-    let app = Arc::new(App {
-        store,
-        palette,
-        font,
-        font_bold,
-        symbol_count: 0,
-        cache: Mutex::new(TileCache::new(768)),
-        hits: AtomicUsize::new(0),
-        misses: AtomicUsize::new(0),
-    });
-
-    let listener = TcpListener::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
-        eprintln!("bind :{port} failed ({e}) — is another tile-server already running?");
-        std::process::exit(1);
-    });
-    eprintln!(
-        "map-launcher tile-server v{} listening on :{port}",
-        env!("CARGO_PKG_VERSION")
-    );
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
-                let app = app.clone();
-                std::thread::spawn(move || handle_client(stream, app));
+        // Headless screenshot capture: ask eframe for a real screenshot of
+        // the painted frame (the reply arrives as an Event::Screenshot).
+        if let Some(capture) = &mut self.capture {
+            capture.frames += 1;
+            match capture.stage {
+                0 if capture.frames >= 70 => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(1u64)));
+                    capture.stage = 1;
+                    capture.frames = 0;
+                }
+                1 => {
+                    if let Some(img) = take_screenshot_event(ctx) {
+                        save_color_image(&img, &capture.dir.join("01-map-tab-layers.png"));
+                        eprintln!("screenshot saved: 01-map-tab-layers.png");
+                        self.tab = Tab::Downloads;
+                        capture.stage = 2;
+                        capture.frames = 0;
+                    } else if capture.frames > 120 {
+                        eprintln!("screenshot 1 timed out");
+                        capture.stage = 4;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        ctx.request_repaint_after(Duration::from_millis(50));
+                    }
+                }
+                2 if capture.frames >= 35 => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(2u64)));
+                    capture.stage = 3;
+                    capture.frames = 0;
+                }
+                3 => {
+                    if let Some(img) = take_screenshot_event(ctx) {
+                        save_color_image(&img, &capture.dir.join("02-downloads-tab.png"));
+                        eprintln!("screenshot saved: 02-downloads-tab.png");
+                        capture.stage = 4;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else if capture.frames > 120 {
+                        eprintln!("screenshot 2 timed out");
+                        capture.stage = 4;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        ctx.request_repaint_after(Duration::from_millis(50));
+                    }
+                }
+                _ => ctx.request_repaint_after(Duration::from_millis(50)),
             }
-            Err(e) => eprintln!("accept error: {e}"),
         }
     }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let running = self.server_running;
+        egui::Panel::left("rail").exact_size(64.0).resizable(false).frame(Frame::new().fill(theme::PANEL).stroke(Stroke::new(1.0, theme::BORDER))).show(ui, |ui| {
+            ui.add_space(10.0);
+            // Logo: two crossing roads on a tile.
+            let (logo_rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(logo_rect, CornerRadius::same(9), theme::ACCENT_DIM);
+            p.line_segment([logo_rect.left_center(), logo_rect.right_center()], Stroke::new(3.5, theme::TEXT));
+            p.line_segment([logo_rect.center_top(), logo_rect.center_bottom()], Stroke::new(2.0, theme::ACCENT));
+            ui.add_space(14.0);
+            for (tab, icon, label) in [(Tab::Map, "🗺", "Map"), (Tab::Downloads, "⬇", "Data")] {
+                let selected = self.tab == tab;
+                let btn = egui::Button::new(egui::RichText::new(format!("{icon}\n{label}")).size(10.5).color(if selected { theme::TEXT } else { theme::DIM }))
+                    .min_size(Vec2::new(52.0, 52.0))
+                    .fill(if selected { theme::ACCENT_DIM } else { Color32::TRANSPARENT });
+                if ui.add(btn).clicked() {
+                    self.tab = tab;
+                }
+                ui.add_space(6.0);
+            }
+            ui.with_layout(Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.add_space(10.0);
+                let (r, _) = ui.allocate_exact_size(Vec2::new(40.0, 16.0), Sense::hover());
+                theme::dot(ui.painter(), Pos2::new(r.center().x - 8.0, r.center().y), if running { theme::OK } else { theme::DIM });
+                ui.painter().text(
+                    Pos2::new(r.center().x + 4.0, r.center().y),
+                    Align2::LEFT_CENTER,
+                    if running { "live" } else { "off" },
+                    FontId::proportional(10.0),
+                    theme::DIM,
+                );
+                ui.label(egui::RichText::new(format!("v{}", tile_server_core::VERSION)).size(10.0).color(theme::DIM));
+            });
+        });
+
+        if self.tab == Tab::Map {
+            egui::Panel::right("layers")
+                .exact_size(324.0)
+                .resizable(false)
+                .frame(Frame::new().fill(theme::PANEL).stroke(Stroke::new(1.0, theme::BORDER)))
+                .show(ui, |ui| {
+                    self.layers.panel_ui(ui, &self.app, &self.data_version);
+                });
+        }
+        egui::CentralPanel::default().frame(Frame::new().fill(theme::BG)).show(ui, |ui| match self.tab {
+            Tab::Map => self.map_tab(ui),
+            Tab::Downloads => self.downloads.tab_ui(ui, &self.app),
+        });
+
+        // Toast (bottom center).
+        if let Some((msg, _at)) = &self.toast {
+            let screen = ctx.input(|i| i.viewport_rect());
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("toast")));
+            let text_size = painter.layout_no_wrap(msg.clone(), FontId::proportional(13.0), theme::TEXT).size();
+            let rect = Rect::from_center_size(Pos2::new(screen.center().x, screen.bottom() - 42.0), Vec2::new(text_size.x + 28.0, 30.0));
+            painter.rect_filled(rect, CornerRadius::same(15), theme::PANEL_2);
+            painter.rect_stroke(rect, CornerRadius::same(15), Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Outside);
+            painter.text(rect.center(), Align2::CENTER_CENTER, msg, FontId::proportional(13.0), theme::TEXT);
+        }
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0x17 as f32 / 255.0, 0x18 as f32 / 255.0, 0x1a as f32 / 255.0, 1.0]
+    }
+}
+
+impl Shell {
+    fn map_tab(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        // Toolbar
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Map").size(17.0).strong());
+            ui.separator();
+            let label = if self.server_running { "Stop server" } else { "Start server" };
+            let (col, text) = if self.server_running { (theme::PANEL_2, theme::TEXT) } else { (theme::OK, Color32::WHITE) };
+            if ui.add(egui::Button::new(egui::RichText::new(label).color(text)).fill(col)).clicked() {
+                self.toggle_server();
+            }
+            let (dot_r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            theme::dot(ui.painter(), dot_r.center(), if self.server_running { theme::OK } else { theme::DIM });
+            let url = format!("http://127.0.0.1:{}", self.port);
+            ui.label(egui::RichText::new(&url).size(12.5).color(theme::DIM).monospace());
+            if ui.small_button("Copy").clicked() {
+                ui.ctx().copy_text(url.clone());
+                self.set_toast("Server URL copied");
+            }
+            ui.separator();
+            let stats = self.app.stats();
+            ui.label(egui::RichText::new(format!(
+                "{} roads · {} buildings · {} POIs",
+                thousands(stats.roads),
+                thousands(stats.buildings),
+                thousands(stats.pois)
+            ))
+            .size(12.5)
+            .color(theme::DIM));
+            let region = self.app.region_name.lock().unwrap().clone();
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new(region).size(12.5).strong());
+            });
+        });
+        ui.add_space(6.0);
+
+        // Canvas fills the rest (the layers live in the right-side panel).
+        egui::Frame::new().fill(theme::PANEL).corner_radius(CornerRadius::same(8)).stroke(Stroke::new(1.0, theme::BORDER)).show(ui, |ui| {
+            self.map.canvas_ui(ui, &self.app, &self.data_version, self.port);
+        });
+    }
+
+    fn toggle_server(&mut self) {
+        if self.server_running {
+            if let Some(h) = self.server.take() {
+                h.stop();
+            }
+            self.server_running = false;
+            self.set_toast(format!("Server stopped (was :{})", self.port));
+        } else {
+            match spawn_server(self.port, self.app.clone()) {
+                Ok(h) => {
+                    self.server = Some(h);
+                    self.server_running = true;
+                    self.set_toast(format!("Serving tiles on :{}", self.port));
+                }
+                Err(e) => {
+                    self.server_running = false;
+                    self.set_toast(format!("Start failed: {e}"));
+                }
+            }
+        }
+    }
+}
+
+fn thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/* --------------------------------------------------------------------- */
+/* Map canvas                                                              */
+/* --------------------------------------------------------------------- */
+
+struct MapState {
+    /// Fractional zoom (4..=19).
+    zoom: f32,
+    /// Center lon/lat.
+    center: (f64, f64),
+    tex: HashMap<(u8, u32, u32), (TextureHandle, u64)>,
+}
+
+impl MapState {
+    fn new(bbox: [f64; 4]) -> Self {
+        Self {
+            zoom: 12.0,
+            center: ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0),
+            tex: HashMap::new(),
+        }
+    }
+
+    fn canvas_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>, data_version: &Arc<AtomicU64>, port: u16) {
+        ui.add_space(8.0);
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+
+        // --- interaction ---------------------------------------------------
+        let z_int = self.zoom.round().clamp(4.0, 19.0) as u8;
+        let scale = world_px(z_int) as f64;
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            let (mut mx, mut my) = lonlat_to_merc(self.center.0, self.center.1);
+            mx -= d.x as f64 / scale;
+            my += d.y as f64 / scale;
+            self.center = merc_to_lonlat(mx.clamp(0.0, 1.0), my.clamp(0.0, 1.0));
+        }
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if resp.hovered() && scroll.abs() > 0.5 {
+            self.zoom = (self.zoom + scroll * 0.01).clamp(4.0, 19.0);
+        }
+        if resp.double_clicked() {
+            self.zoom = (self.zoom + 1.0).clamp(4.0, 19.0);
+        }
+
+        // --- paint ----------------------------------------------------------
+        let painter = ui.painter_at(rect);
+        let land = app.palette.get("land-color").unwrap_or(carto_style::Rgba::rgb(0xf2, 0xef, 0xe9));
+        painter.rect_filled(rect, CornerRadius::same(8), Color32::from_rgb(land.r, land.g, land.b));
+
+        let layer_version = app.layers.read().unwrap().version;
+        let dv = data_version.load(Ordering::Relaxed);
+        let stamp = (layer_version << 8) | (dv & 0xff).min(0xff);
+
+        let (cx_m, cy_m) = lonlat_to_merc(self.center.0, self.center.1);
+        let world = scale;
+        let top_left_m = (cx_m * world - rect.width() as f64 / 2.0, cy_m * world - rect.height() as f64 / 2.0);
+        let tiles = 1u32 << z_int;
+        let t0x = (top_left_m.0 / 256.0).floor().max(0.0) as u32;
+        let t0y = (top_left_m.1 / 256.0).floor().max(0.0) as u32;
+        let t1x = (((top_left_m.0 + rect.width() as f64) / 256.0).floor() as u32).min(tiles - 1);
+        let t1y = (((top_left_m.1 + rect.height() as f64) / 256.0).floor() as u32).min(tiles - 1);
+
+        let mut budget = 3usize;
+        for ty in t0y..=t1y {
+            for tx in t0x..=t1x {
+                let px = (tx as f64 * 256.0 - top_left_m.0) as f32 + rect.left();
+                let py = (ty as f64 * 256.0 - top_left_m.1) as f32 + rect.top();
+                let dst = Rect::from_min_size(Pos2::new(px, py), Vec2::splat(256.0));
+                let key = (z_int, tx, ty);
+                let fresh = self.tex.get(&key).is_some_and(|(_, v)| *v == stamp);
+                if !fresh && budget > 0 {
+                    if let Some(pm) = render_tile_pixmap(app, &app.store.read().unwrap(), &app.layers.read().unwrap(), z_int, tx, ty) {
+                        let (w, h) = (pm.width() as usize, pm.height() as usize);
+                        let mut rgba = pm.data().to_vec();
+                        unpremultiply(&mut rgba);
+                        let img = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                        let handle = ui.ctx().load_texture(format!("tile-{z_int}-{tx}-{ty}"), img, TextureOptions::LINEAR);
+                        self.tex.insert(key, (handle, stamp));
+                        budget -= 1;
+                    }
+                }
+                if let Some((handle, v)) = self.tex.get(&key) {
+                    if *v == stamp {
+                        painter.image(handle.id(), dst, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    }
+                }
+                // Evict stale textures when the cache grows.
+                if self.tex.len() > 96 {
+                    self.tex.retain(|_, (_, v)| *v == stamp);
+                }
+            }
+        }
+
+        // --- overlays --------------------------------------------------------
+        painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+        let badge = |painter: &egui::Painter, pos: Pos2, text: String, col: Color32| {
+            let size = painter.layout_no_wrap(text.clone(), FontId::monospace(11.0), col).size();
+            let r = Rect::from_min_size(pos + Vec2::new(8.0, 8.0), Vec2::new(size.x + 14.0, 22.0));
+            painter.rect_filled(r, CornerRadius::same(6), theme::BG.gamma_multiply(0.85));
+            painter.text(r.center(), Align2::CENTER_CENTER, text, FontId::monospace(11.0), col);
+        };
+        let region = app.region_name.lock().unwrap().clone();
+        badge(&painter, rect.left_top(), region, theme::TEXT);
+        badge(&painter, rect.left_bottom() + Vec2::new(0.0, -30.0), format!("z{:.1}", self.zoom), theme::ACCENT);
+        painter.text(
+            rect.right_bottom() + Vec2::new(-8.0, -6.0),
+            Align2::RIGHT_BOTTOM,
+            format!("tiles http://127.0.0.1:{port}/tile/{{z}}/{{x}}/{{y}}.png · © OpenStreetMap contributors"),
+            FontId::proportional(10.5),
+            theme::DIM,
+        );
+
+        // Zoom controls (right-bottom).
+        let mut zui = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(12.0)));
+        zui.with_layout(Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+            ui.vertical(|ui| {
+                if ui.add(egui::Button::new("+").min_size(Vec2::splat(30.0))).clicked() {
+                    self.zoom = (self.zoom + 1.0).clamp(4.0, 19.0);
+                }
+                if ui.add(egui::Button::new("−").min_size(Vec2::splat(30.0))).clicked() {
+                    self.zoom = (self.zoom - 1.0).clamp(4.0, 19.0);
+                }
+                if ui.add(egui::Button::new("⌂").min_size(Vec2::splat(30.0))).clicked() {
+                    let b = app.store.read().unwrap().bbox;
+                    self.center = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+                    self.zoom = 12.0;
+                }
+            });
+        });
+
+        if budget < 3 {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+    }
+}
+
+/// egui wants straight alpha; tiny_skia stores premultiplied.
+fn unpremultiply(rgba: &mut [u8]) {
+    for px in rgba.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a == 255 || a == 0 {
+            continue;
+        }
+        px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+        px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+        px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* Layers panel (vectorcraft layer-engine style)                           */
+/* --------------------------------------------------------------------- */
+
+/// Panel geometry, straight from the reference: eye column, colour bar,
+/// disclosure chevron, name, then the zoom badge on the right.
+const COLUMN: f32 = 25.0;
+const INDENT: f32 = 14.0;
+const ROW_H: f32 = 26.0;
+
+#[derive(Default)]
+struct PanelState {
+    search: String,
+    open: std::collections::HashSet<String>,
+    selected: Option<String>,
+    /// Property editors for the selected layer.
+    edit_zoom: [i32; 2],
+}
+
+impl PanelState {
+    fn panel_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>, data_version: &Arc<AtomicU64>) {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Layers").size(15.5).strong());
+            ui.separator();
+            if ui.small_button("Show all").clicked() {
+                let mut vis = app.layers.write().unwrap();
+                vis.visible.clear();
+                vis.touch();
+                app.invalidate();
+                data_version.fetch_add(1, Ordering::Relaxed);
+            }
+            if ui.small_button("Hide all").clicked() {
+                let mut vis = app.layers.write().unwrap();
+                for d in layer_catalog() {
+                    vis.visible.insert(d.id.to_string(), false);
+                }
+                vis.touch();
+                app.invalidate();
+                data_version.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        ui.add_space(4.0);
+        ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search layers…").desired_width(f32::INFINITY));
+        ui.add_space(4.0);
+
+        let defs = layer_catalog();
+        let vis_snapshot = app.layers.read().unwrap().clone();
+        let query = self.search.trim().to_lowercase();
+
+        // Row list (groups first, children indented).
+        let mut rows: Vec<(&LayerDef, usize)> = Vec::new();
+        for d in &defs {
+            if d.parent.is_empty() {
+                if !query.is_empty() {
+                    // Match groups with any child hit too.
+                    let children_hit = defs.iter().any(|c| c.parent == d.id && (c.id.contains(&query) || c.name.to_lowercase().contains(&query)));
+                    if !(d.id.contains(&query) || d.name.to_lowercase().contains(&query) || children_hit) {
+                        continue;
+                    }
+                }
+                rows.push((d, 0));
+                if self.open.contains(d.id) || !query.is_empty() {
+                    for c in &defs {
+                        if c.parent == d.id {
+                            if !query.is_empty() && !(c.id.contains(&query) || c.name.to_lowercase().contains(&query)) {
+                                continue;
+                            }
+                            rows.push((c, 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        // The properties editor takes the bottom half; the tree scrolls on top.
+        let total_h = ui.available_height() - 6.0;
+        let list_h = if self.selected.is_some() { (total_h * 0.52).max(160.0) } else { total_h };
+
+        egui::ScrollArea::vertical().id_salt("layer-rows").max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (d, depth) in rows.iter() {
+                self.row_ui(ui, d, *depth, &vis_snapshot, app, data_version);
+            }
+        });
+
+        // Engine layer properties for the selected layer.
+        if let Some(sel) = self.selected.clone() {
+            ui.add_space(6.0);
+            ui.separator();
+            if let Some(def) = defs.iter().find(|d| d.id == sel) {
+                self.properties_ui(ui, def, app, data_version, &vis_snapshot);
+            }
+        }
+    }
+
+    fn row_ui(&mut self, ui: &mut egui::Ui, d: &LayerDef, depth: usize, vis: &LayerVis, app: &Arc<App>, data_version: &Arc<AtomicU64>) {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
+        let selected = self.selected.as_deref() == Some(d.id);
+        if selected {
+            ui.painter().rect_filled(rect, 0.0, theme::ROW_SEL);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, 0.0, theme::PANEL_2.gamma_multiply(0.6));
+        }
+        ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::BORDER));
+
+        let p = ui.painter();
+        let visible = vis.is_visible(d.id);
+        let dim = if visible { theme::TEXT } else { theme::DIM };
+
+        // Eye column (painted, not a glyph — survives any font set).
+        let eye_c = Pos2::new(rect.left() + COLUMN / 2.0, rect.center().y);
+        let eye_col = if visible { theme::OK } else { theme::DIM };
+        p.circle_stroke(eye_c, 5.0, Stroke::new(1.4, eye_col));
+        if visible {
+            p.circle_filled(eye_c, 2.4, eye_col);
+        }
+
+        // Colour bar (group = wide, child = thin) — vectorcraft's marker.
+        let mut x = rect.left() + COLUMN + 2.0;
+        let bar_w = if d.kind == "group" { 4.0 } else { 2.0 };
+        let col = layer_color(app, vis, d);
+        p.rect_filled(Rect::from_min_size(Pos2::new(x - 1.0, rect.top() + 3.0), Vec2::new(bar_w, ROW_H - 6.0)), 0.0, col);
+        x += 8.0 + depth as f32 * INDENT;
+
+        // Disclosure chevron for groups.
+        let is_group = d.kind == "group";
+        if is_group {
+            let open = self.open.contains(d.id) || !self.search.trim().is_empty();
+            let dr = Rect::from_min_size(Pos2::new(x, rect.center().y - 8.0), Vec2::new(14.0, 16.0));
+            let c = dr.center();
+            let tri: Vec<Pos2> = if open {
+                vec![Pos2::new(c.x - 4.0, c.y - 2.0), Pos2::new(c.x + 4.0, c.y - 2.0), Pos2::new(c.x, c.y + 3.0)]
+            } else {
+                vec![Pos2::new(c.x - 2.0, c.y - 4.0), Pos2::new(c.x - 2.0, c.y + 4.0), Pos2::new(c.x + 3.0, c.y)]
+            };
+            p.add(egui::Shape::convex_polygon(tri, theme::DIM, Stroke::NONE));
+            let dresp = ui.interact(dr, ui.id().with(("disc", d.id)), Sense::click());
+            if dresp.clicked() {
+                if open {
+                    self.open.remove(d.id);
+                } else {
+                    self.open.insert(d.id.to_string());
+                }
+            }
+        }
+        x += 16.0;
+
+        // Name + kind chip.
+        p.text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, d.name, FontId::proportional(12.5), dim);
+        let kind_col = match d.kind {
+            "engine" => theme::WARN,
+            "label" => theme::ACCENT,
+            _ => theme::DIM,
+        };
+        if d.kind != "group" {
+            let label = d.kind.to_uppercase();
+            let name_w = p.layout_no_wrap(d.name.to_string(), FontId::proportional(12.5), dim).size().x;
+            p.text(Pos2::new(x + name_w + 8.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(8.5), kind_col);
+        }
+
+        // Zoom badge on the right.
+        let (zmin, zmax) = vis.zoom.get(d.id).copied().unwrap_or((d.min_zoom, d.max_zoom));
+        let badge = if zmax >= 19 { format!("z{zmin}+") } else { format!("z{zmin}–{zmax}") };
+        p.text(Pos2::new(rect.right() - 6.0, rect.center().y), Align2::RIGHT_CENTER, badge, FontId::monospace(9.5), theme::DIM);
+
+        // Interactions: click on the eye column toggles, click on the row selects.
+        if resp.clicked() {
+            let on_eye = resp.interact_pointer_pos().is_some_and(|p| p.x - rect.left() < COLUMN);
+            if on_eye {
+                self.toggle(app, d.id, !visible, data_version);
+            } else {
+                self.selected = Some(d.id.to_string());
+                let (mn, mx) = vis.zoom.get(d.id).copied().unwrap_or((d.min_zoom, d.max_zoom));
+                self.edit_zoom = [mn as i32, mx as i32];
+            }
+        }
+    }
+
+    fn toggle(&mut self, app: &Arc<App>, id: &str, value: bool, data_version: &Arc<AtomicU64>) {
+        {
+            let mut vis = app.layers.write().unwrap();
+            vis.visible.insert(id.to_string(), value);
+            vis.touch();
+        }
+        app.invalidate();
+        data_version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn properties_ui(&mut self, ui: &mut egui::Ui, def: &LayerDef, app: &Arc<App>, data_version: &Arc<AtomicU64>, vis: &LayerVis) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("ENGINE LAYER PROPERTIES").size(10.0).strong().color(theme::DIM));
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Reset").clicked() {
+                    let mut v = app.layers.write().unwrap();
+                    v.visible.remove(def.id);
+                    v.opacity.remove(def.id);
+                    v.zoom.remove(def.id);
+                    v.color.remove(def.id);
+                    v.touch();
+                    app.invalidate();
+                    data_version.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        });
+        egui::ScrollArea::vertical().id_salt("layer-props").auto_shrink([false, false]).show(ui, |ui| {
+            // Vector path (the data this layer paints).
+            ui.label(egui::RichText::new("Vector path").size(10.5).color(theme::DIM));
+            egui::Frame::new().fill(theme::BG).corner_radius(CornerRadius::same(5)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(def.vector_path).size(11.0).monospace().color(theme::TEXT));
+            });
+
+            // Paint: fill colour + swatch.
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(match def.kind { "fill" => "Fill", "stroke" => "Stroke", "label" => "Label paint", "engine" => "Engine paint", _ => "Paint" }).size(10.5).color(theme::DIM));
+            ui.horizontal(|ui| {
+                let col = layer_color(app, vis, def);
+                let (sw, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+                ui.painter().rect_filled(sw, CornerRadius::same(4), col);
+                ui.painter().rect_stroke(sw, CornerRadius::same(4), Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Outside);
+                let mut hex = format!("#{:02X}{:02X}{:02X}", col.r(), col.g(), col.b());
+                let resp = ui.add(egui::TextEdit::singleline(&mut hex).desired_width(86.0).font(FontId::monospace(12.0)));
+                if resp.changed() {
+                    if let Some(c) = parse_hex(&hex) {
+                        let mut v = app.layers.write().unwrap();
+                        v.color.insert(def.id.to_string(), c);
+                        v.touch();
+                        app.invalidate();
+                        data_version.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if vis.color_override(def.id).is_some() && ui.small_button("palette").clicked() {
+                    let mut v = app.layers.write().unwrap();
+                    v.color.remove(def.id);
+                    v.touch();
+                    app.invalidate();
+                    data_version.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+
+            // Opacity.
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Opacity").size(10.5).color(theme::DIM));
+            let mut op = vis.alpha(def.id);
+            let slider = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(true));
+            if slider.changed() {
+                let mut v = app.layers.write().unwrap();
+                v.opacity.insert(def.id.to_string(), op);
+                v.touch();
+                app.invalidate();
+                data_version.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Zoom range.
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Zoom range").size(10.5).color(theme::DIM));
+            ui.horizontal(|ui| {
+                let mut edited = false;
+                let a = ui.add(egui::DragValue::new(&mut self.edit_zoom[0]).range(0..=19).prefix("z").speed(0.2));
+                ui.label("–");
+                let b = ui.add(egui::DragValue::new(&mut self.edit_zoom[1]).range(0..=19).prefix("z").speed(0.2));
+                if a.changed() || b.changed() {
+                    if self.edit_zoom[1] < self.edit_zoom[0] {
+                        self.edit_zoom[1] = self.edit_zoom[0];
+                    }
+                    edited = true;
+                }
+                if edited {
+                    let mut v = app.layers.write().unwrap();
+                    v.zoom.insert(def.id.to_string(), (self.edit_zoom[0].clamp(0, 19) as u8, self.edit_zoom[1].clamp(0, 19) as u8));
+                    v.touch();
+                    app.invalidate();
+                    data_version.fetch_add(1, Ordering::Relaxed);
+                }
+                if !vis.zoom.contains_key(def.id) {
+                    ui.label(egui::RichText::new(format!("(default {}–{})", def.min_zoom, def.max_zoom)).size(9.5).color(theme::DIM));
+                }
+            });
+
+            // Engine flags (roads only).
+            if def.parent == "roads" || def.id == "roads" {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Engine").size(10.5).color(theme::DIM));
+                ui.label(egui::RichText::new("Casing under fill · oneway arrows from z16 · name shields from z13 · lane widths from maxspeed/lanes tags").size(10.0).color(theme::DIM));
+            }
+        });
+    }
+}
+
+fn layer_color(app: &Arc<App>, vis: &LayerVis, d: &LayerDef) -> Color32 {
+    if let Some([r, g, b]) = vis.color_override(d.id) {
+        return Color32::from_rgb(r, g, b);
+    }
+    let base = d.color_var.and_then(|v| app.palette.get(v)).unwrap_or(carto_style::Rgba::rgb(d.fallback[0], d.fallback[1], d.fallback[2]));
+    Color32::from_rgb(base.r, base.g, base.b)
+}
+
+fn parse_hex(s: &str) -> Option<[u8; 3]> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    Some([u8::from_str_radix(&s[0..2], 16).ok()?, u8::from_str_radix(&s[2..4], 16).ok()?, u8::from_str_radix(&s[4..6], 16).ok()?])
+}
+
+/* --------------------------------------------------------------------- */
+/* Downloads tab (craft-launcher region cards)                             */
+/* --------------------------------------------------------------------- */
+
+struct DownloadsState {
+    manager: Arc<Manager>,
+    jobs: HashMap<String, Phase>,
+    last_jobs: HashMap<String, Phase>,
+    custom_url: String,
+    custom_bbox_world: [f64; 4],
+    data_version: Arc<AtomicU64>,
+}
+
+impl DownloadsState {
+    fn new() -> Self {
+        Self { manager: Arc::new(Manager::new()), jobs: HashMap::new(), last_jobs: HashMap::new(), custom_url: String::new(), custom_bbox_world: [-180.0, -85.0, 180.0, 85.0], data_version: Arc::new(AtomicU64::new(1)) }
+    }
+
+    fn regions_dir(&self, _app: &Arc<App>) -> PathBuf {
+        tile_server_core::abs_root().join("data").join("regions")
+    }
+
+    fn downloads_dir(&self, _app: &Arc<App>) -> PathBuf {
+        tile_server_core::abs_root().join("data").join("downloads")
+    }
+
+    /// Poll the manager, swap in a freshly extracted store, keep the UI alive.
+    fn poll(&mut self, ctx: &egui::Context, app: &Arc<App>, data_version: &Arc<AtomicU64>) {
+        self.jobs = self.manager.all();
+        let mut any_active = false;
+        for (id, phase) in &self.jobs {
+            if phase.is_active() {
+                any_active = true;
+            }
+            let was = self.last_jobs.get(id);
+            if matches!(phase, Phase::Installed { .. }) && !was.is_some_and(|p| matches!(p, Phase::Installed { .. })) {
+                // Freshly installed: swap the store in and tell the user.
+                let dir = self.regions_dir(app).join(id);
+                match carto_core::Store::load(&dir) {
+                    Ok(store) => {
+                        let label = region_label(id);
+                        *app.store.write().unwrap() = store;
+                        *app.region_name.lock().unwrap() = label.clone();
+                        app.invalidate();
+                        data_version.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => eprintln!("store load failed for {id}: {e}"),
+                }
+            }
+        }
+        self.last_jobs = self.jobs.clone();
+        if any_active {
+            ctx.request_repaint_after(Duration::from_millis(400));
+        }
+    }
+
+    fn start(&mut self, app: &Arc<App>, id: &str, name: &str, bbox: [f64; 4], url: &str) {
+        self.manager.start(
+            RegionReq { id: id.to_string(), name: name.to_string(), bbox, url: url.to_string() },
+            self.downloads_dir(app),
+            self.regions_dir(app),
+        );
+    }
+
+    fn tab_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>) {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Downloads").size(17.0).strong());
+            ui.separator();
+            ui.label(egui::RichText::new("Tanzania map parts — download, extract, serve. Same flow the launcher uses for its apps.").size(12.0).color(theme::DIM));
+        });
+        ui.add_space(4.0);
+
+        // Custom PBF URL row.
+        egui::Frame::new().fill(theme::PANEL).corner_radius(CornerRadius::same(8)).stroke(Stroke::new(1.0, theme::BORDER)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Custom URL").size(11.0).color(theme::DIM));
+                let w = ui.available_width() - 250.0;
+                ui.add(egui::TextEdit::singleline(&mut self.custom_url).hint_text("https://…/any-extract.osm.pbf").desired_width(w.max(120.0)).font(FontId::monospace(11.5)));
+                let enabled = self.custom_url.trim().starts_with("http");
+                if ui.add_enabled(enabled, egui::Button::new("Download & extract")).clicked() {
+                    let url = self.custom_url.trim().to_string();
+                    let stem = pbf_name_for(&url).trim_end_matches(".osm.pbf").trim_end_matches(".pbf").to_string();
+                    let id = format!("custom-{}", sanitize(&stem));
+                    self.start(app, &id, &stem, self.custom_bbox_world, &url);
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        // Region cards (single column, full width — no cell sizing games).
+        let regions: Vec<Region> = tile_server_core::download::regions();
+        egui::ScrollArea::vertical().id_salt("region-cards").auto_shrink([false, false]).show(ui, |ui| {
+            let card_w = ui.available_width();
+            for r in &regions {
+                self.card_ui(ui, app, r, card_w);
+                ui.add_space(10.0);
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Data © OpenStreetMap contributors (ODbL) · PBF extracts served by download.geofabrik.de · stores built with the same extractor as tile-server-cli extract").size(10.0).color(theme::DIM));
+    }
+
+    fn card_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>, r: &Region, w: f32) {
+        let phase = self.jobs.get(r.id).cloned().unwrap_or(Phase::Idle);
+        let active = phase.is_active();
+        let installed = store_installed(&self.regions_dir(app).join(r.id)) || matches!(phase, Phase::Installed { .. });
+        let active_region = app.region_name.lock().unwrap().clone();
+
+        egui::Frame::new().fill(theme::PANEL).corner_radius(CornerRadius::same(8)).stroke(Stroke::new(1.0, if active { theme::ACCENT } else { theme::BORDER })).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+            ui.set_min_width(w - 24.0);
+            ui.set_max_width(w - 24.0);
+
+            // Title + status pill.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(r.name).size(14.5).strong());
+                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    match &phase {
+                        Phase::Idle if installed => pill_local(ui, if active_region == r.name { "In use" } else { "Installed" }, theme::OK),
+                        Phase::Idle => pill_local(ui, "Not installed", theme::DIM),
+                        Phase::Queued => pill_local(ui, "Queued", theme::WARN),
+                        Phase::Downloading { .. } | Phase::Reconnecting { .. } => pill_local(ui, "Downloading", theme::WARN),
+                        Phase::Extracting { .. } => pill_local(ui, "Extracting", theme::WARN),
+                        Phase::Installed { .. } => pill_local(ui, "Installed", theme::OK),
+                        Phase::Failed { .. } => pill_local(ui, "Failed", theme::DANGER),
+                    }
+                });
+            });
+            ui.label(egui::RichText::new(r.desc).size(11.5).color(theme::DIM).weak());
+
+            // Meta: bbox + size.
+            ui.label(
+                egui::RichText::new(format!(
+                    "bbox {:.1}, {:.1} → {:.1}, {:.1}   ·   {}   ·   {}",
+                    r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3], r.size_hint,
+                    if r.shared { "crops the shared Tanzania PBF" } else { "direct PBF download" }
+                ))
+                .size(10.5)
+                .monospace()
+                .color(theme::DIM),
+            );
+
+            // Source URL row (the launcher's release link).
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("source").size(10.0).color(theme::DIM));
+                ui.hyperlink_to(egui::RichText::new(shorten_url(r.url, 58)).size(10.5).monospace(), r.url);
+                if ui.small_button("Copy URL").clicked() {
+                    ui.ctx().copy_text(r.url.to_string());
+                }
+            });
+
+            // Progress.
+            match &phase {
+                Phase::Downloading { done, total } | Phase::Reconnecting { done, total } => {
+                    let frac = if *total > 0 { *done as f32 / *total as f32 } else { 0.15 };
+                    ui.add(egui::ProgressBar::new(frac.clamp(0.02, 1.0)).show_percentage());
+                    ui.label(
+                        egui::RichText::new(if matches!(phase, Phase::Reconnecting { .. }) {
+                            format!("Reconnecting — {} of {} done", fmt_bytes(*done), if *total > 0 { fmt_bytes(*total) } else { "unknown size".into() })
+                        } else {
+                            format!("{} of {}", fmt_bytes(*done), if *total > 0 { fmt_bytes(*total) } else { "unknown size".into() })
+                        })
+                        .size(10.5)
+                        .color(theme::DIM),
+                    );
+                }
+                Phase::Extracting { message } => {
+                    ui.add(egui::ProgressBar::new(0.75).animate(true));
+                    ui.label(egui::RichText::new(message).size(10.5).color(theme::DIM));
+                }
+                Phase::Installed { roads, buildings, pois } => {
+                    ui.label(egui::RichText::new(format!("{} roads · {} buildings · {} POIs", thousands(*roads), thousands(*buildings), thousands(*pois))).size(11.0).color(theme::OK));
+                }
+                Phase::Failed { message } => {
+                    ui.label(egui::RichText::new(message).size(10.5).color(theme::DANGER));
+                }
+                Phase::Idle | Phase::Queued => {
+                    if installed {
+                        if let Ok(meta) = std::fs::metadata(self.regions_dir(app).join(r.id).join("store.bin")) {
+                            ui.label(egui::RichText::new(format!("store.bin {} on disk", fmt_bytes(meta.len()))).size(10.5).color(theme::DIM));
+                        }
+                    }
+                }
+            }
+
+            // Buttons.
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                if active {
+                    if ui.add(egui::Button::new(egui::RichText::new("Cancel").color(theme::DANGER))).clicked() {
+                        self.manager.cancel(r.id);
+                    }
+                } else if ui.add(egui::Button::new(if installed { "Redownload" } else { "Download" }).fill(if installed { theme::PANEL_2 } else { theme::ACCENT_DIM })).clicked() {
+                    self.start(app, r.id, r.name, r.bbox, r.url);
+                }
+                if installed && active_region != r.name && ui.add(egui::Button::new("Use this region")).clicked() {
+                    let dir = self.regions_dir(app).join(r.id);
+                    match carto_core::Store::load(&dir) {
+                        Ok(store) => {
+                            *app.store.write().unwrap() = store;
+                            *app.region_name.lock().unwrap() = r.name.to_string();
+                            app.invalidate();
+                            self.data_version.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            // Leave the current store; surface the error inline next poll.
+                            self.jobs.insert(r.id.to_string(), Phase::Failed { message: format!("store load failed: {e}") });
+                        }
+                    }
+                }
+                if installed && ui.small_button("Reveal").clicked() {
+                    let dir = self.regions_dir(app).join(r.id);
+                    ui.ctx().copy_text(dir.display().to_string());
+                }
+            });
+        });
+    }
+}
+
+fn pill_local(ui: &mut egui::Ui, text: &str, color: Color32) {
+    theme::pill(ui, text, color);
+}
+
+fn region_label(id: &str) -> String {
+    let regions = tile_server_core::download::regions();
+    regions.iter().find(|r| r.id == id).map(|r| r.name.to_string()).unwrap_or_else(|| id.to_string())
+}
+
+fn store_installed(dir: &std::path::Path) -> bool {
+    dir.join("store.bin").is_file()
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect::<String>().trim_matches('-').to_string()
+}
+
+fn shorten_url(u: &str, max: usize) -> String {
+    if u.len() > max {
+        format!("{}…", &u[..max.saturating_sub(1)])
+    } else {
+        u.to_string()
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* Screenshot capture (xvfb / --screenshot <dir>)                          */
+/* --------------------------------------------------------------------- */
+
+/// The screenshot eframe took of the previous painted frame, if any.
+fn take_screenshot_event(ctx: &egui::Context) -> Option<egui::ColorImage> {
+    ctx.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Screenshot { image, .. } => Some((**image).clone()),
+            _ => None,
+        })
+    })
+}
+
+/// Save a straight-alpha ColorImage as a PNG.
+fn save_color_image(img: &egui::ColorImage, path: &std::path::Path) {
+    let (w, h) = (img.size[0] as usize, img.size[1] as usize);
+    let mut premul = Vec::with_capacity(w * h * 4);
+    for px in &img.pixels {
+        let (r, g, b, a) = (px.r() as u32, px.g() as u32, px.b() as u32, px.a() as u32);
+        premul.push(((r * a + 127) / 255) as u8);
+        premul.push(((g * a + 127) / 255) as u8);
+        premul.push(((b * a + 127) / 255) as u8);
+        premul.push(a as u8);
+    }
+    let Some(size) = tiny_skia::IntSize::from_wh(w as u32, h as u32) else { return };
+    let Some(pm) = tiny_skia::Pixmap::from_vec(premul, size) else { return };
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")));
+    let _ = pm.save_png(path);
 }

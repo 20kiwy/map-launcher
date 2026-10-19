@@ -749,7 +749,7 @@ fn walk_embedded_symbols(dir: &Dir<'static>, reg: &mut SymbolRegistry) {
 /* Fonts                                                                   */
 /* --------------------------------------------------------------------- */
 //
-// Font importing follows the craft-launcher pattern (vendor/craft-launcher
+// Font importing follows the craft-launcher pattern (clone/craft-launcher
 // `crates/ui-egui/src/{theme.rs,cjk_font.rs}`):
 //   1. a bundled face ships with the app and is the guaranteed baseline,
 //   2. system font directories are scanned per-OS (Windows %SystemRoot%\Fonts,

@@ -2,6 +2,7 @@
 name = "tile-server"
 version.workspace = true
 edition.workspace = true
+description = "map-launcher tile-server: the tile server with the Map/Downloads desktop app"
 
 [[bin]]
 name = "tile-server"
@@ -15,3 +16,8 @@ serde_json = "1"
 carto-math = { path = "../carto-math" }
 carto-style = { path = "../carto-style" }
 carto-core = { path = "../carto-core" }
+tile-server-core = { path = "../tile-server-core" }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11"] }
+
+[package.metadata.notes]
+ui = "egui shell: Map tab (tile canvas + vectocraft-style layer engine panel) + Downloads tab (craft-launcher-style region cards)"

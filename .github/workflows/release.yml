@@ -45,6 +45,7 @@ jobs:
           DIR="dist/map-launcher-${TAG}"
           mkdir -p "$DIR/data"
           cp target/release/tile-server "$DIR/"
+          cp target/release/tile-server-cli "$DIR/"
           cp ../../README-RELEASE.md "$DIR/README.txt"
           cp data/registry.json "$DIR/data/" 2>/dev/null || true
           tar czf "tile-server-${TAG}-linux-x64.tar.gz" -C dist "map-launcher-${TAG}"
@@ -58,6 +59,7 @@ jobs:
           $dir = "dist/map-launcher-$tag"
           New-Item -ItemType Directory -Force -Path "$dir/data" | Out-Null
           Copy-Item target/release/tile-server.exe "$dir/"
+          Copy-Item target/release/tile-server-cli.exe "$dir/"
           Copy-Item ../../README-RELEASE.md "$dir/README.txt"
           Copy-Item data/registry.json "$dir/data/" -ErrorAction SilentlyContinue
           Copy-Item data/README.md "$dir/data/" -ErrorAction SilentlyContinue
