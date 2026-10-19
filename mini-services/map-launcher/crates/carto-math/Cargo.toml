@@ -1,0 +1,6 @@
+[package]
+name = "carto-math"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

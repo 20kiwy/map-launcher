@@ -1,0 +1,6 @@
+[package]
+name = "carto-style"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

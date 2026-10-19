@@ -1,0 +1,6 @@
+[submodule "vendor/openstreetmap-carto"]
+	path = vendor/openstreetmap-carto
+	url = https://github.com/openstreetmap-carto/openstreetmap-carto.git
+[submodule "vendor/craft-launcher"]
+	path = vendor/craft-launcher
+	url = https://github.com/storytold/craft-launcher.git

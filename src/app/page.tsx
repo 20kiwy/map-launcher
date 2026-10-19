@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Building2, MapPin, RefreshCw, Route, Tags } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PalettePanel } from "@/components/map/palette-panel";
@@ -12,8 +13,12 @@ import { ScreenshotsStrip } from "@/components/map/screenshots-strip";
 import { SlippyMap, type SlippyMapHandle } from "@/components/map/slippy-map";
 import {
   CARTO,
+  directionLabel,
+  formatLength,
   formatNumber,
   gwUrl,
+  onewayLabel,
+  roadClassColor,
   type LonLat,
   type Poi,
   type RoadDetail,
@@ -63,6 +68,44 @@ function StatChip({
       <span className="font-semibold text-[#f2efe9]">{value}</span>
       <span className="hidden sm:inline">{label}</span>
     </span>
+  );
+}
+
+/** Selected-road facts: direction, lanes, maxspeed (roads.mss ::directions data). */
+function RoadInfoBar({ road }: { road: RoadDetail }) {
+  const oneway = onewayLabel(road.oneway);
+  return (
+    <div
+      aria-label="Selected road details"
+      className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-[#2c2c2c]/10 bg-white px-3 py-2 text-[12px] text-[#2c2c2c]"
+    >
+      <span className="font-semibold">{road.name || "(unnamed)"}</span>
+      <Badge
+        className="border border-black/10 text-[10px]"
+        style={{ backgroundColor: roadClassColor(road.class) }}
+      >
+        {road.class}
+      </Badge>
+      <span className="text-[#6b6b66]">
+        <span className="font-medium text-[#2c2c2c]">direction</span> {directionLabel(road.oneway)}
+      </span>
+      <span className="text-[#6b6b66]">
+        <span className="font-medium text-[#2c2c2c]">lanes</span>{" "}
+        {road.lanes > 0 ? road.lanes : "—"}
+      </span>
+      <span className="text-[#6b6b66]">
+        <span className="font-medium text-[#2c2c2c]">maxspeed</span>{" "}
+        {road.maxspeed > 0 ? `${road.maxspeed} km/h` : "—"}
+      </span>
+      <span className="text-[#6b6b66]">
+        <span className="font-medium text-[#2c2c2c]">length</span> {formatLength(road.length_m)}
+      </span>
+      {oneway ? (
+        <Badge className="border border-[#dc2a67]/30 bg-[#fbe4ec] text-[10px] text-[#8f1f48]">
+          {oneway}
+        </Badge>
+      ) : null}
+    </div>
   );
 }
 
@@ -214,6 +257,7 @@ export default function Home() {
                 />
               </div>
             </Card>
+            {roadDetail ? <RoadInfoBar road={roadDetail} /> : null}
           </section>
 
           {/* registries */}

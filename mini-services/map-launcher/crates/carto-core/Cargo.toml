@@ -1,0 +1,10 @@
+[package]
+name = "carto-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+osmpbf = "0.3"
+carto-math = { path = "../carto-math" }

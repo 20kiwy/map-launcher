@@ -53,10 +53,12 @@ server.log
 # Skills directory
 /skills/
 
-# rust workspace + vendored repos (kept out of Tailwind v4 source scanning;
-# the 2.8GB target/ dir otherwise OOM-kills the postcss worker)
-/mini-services
-/vendor
+# Rust build artifacts + large geo data (kept out of Tailwind v4 source
+# scanning too — the multi-GB target/ dir OOM-kills the postcss worker).
+# The vendored upstream repos live in vendor/ as git submodules.
+/mini-services/map-launcher/target/
+/mini-services/map-launcher/data/*
+!/mini-services/map-launcher/data/registry.json
 /tests
 /db
-/agent-ctx
+/agent-ctxtool-results/

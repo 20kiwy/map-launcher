@@ -138,6 +138,9 @@ export function RoadsPanel({ selectedRoadId, onSelectRoad }: RoadsPanelProps) {
                       </span>
                       <span className="block truncate font-mono text-[10.5px] text-[#6b6b66]">
                         {formatLength(road.length_m)} · id {road.id}
+                        {road.oneway !== 0 ? " · one-way" : ""}
+                        {road.lanes > 0 ? ` · ${road.lanes} lanes` : ""}
+                        {road.maxspeed > 0 ? ` · ${road.maxspeed} km/h` : ""}
                       </span>
                     </span>
                     <Badge

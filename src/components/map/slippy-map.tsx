@@ -18,7 +18,7 @@ import { CARTO, tileUrl, type BBox, type LonLat } from "@/lib/map-api";
 
 const TILE = 256;
 const MIN_Z = 5;
-const MAX_Z = 16;
+const MAX_Z = 19;
 const MAX_CACHE = 400;
 
 interface View {

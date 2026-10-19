@@ -47,6 +47,10 @@ export interface RoadSummary {
   length_m: number;
   bbox: BBox;
   named: boolean;
+  /** 0 = two-way, 1 = oneway, 2 = reverse oneway. */
+  oneway: number;
+  lanes: number;
+  maxspeed: number;
 }
 
 export interface RoadsResponse {
@@ -59,6 +63,9 @@ export interface RoadDetail {
   name: string;
   class: string;
   length_m: number;
+  oneway: number;
+  lanes: number;
+  maxspeed: number;
   points: LonLat[];
 }
 
@@ -161,4 +168,18 @@ export function prettyCategory(category: string): string {
   const i = category.indexOf("_");
   if (i <= 0) return category;
   return `${category.slice(0, i)} · ${category.slice(i + 1).replace(/_/g, " ")}`;
+}
+
+/** oneway code -> short label (openstreetmap-carto oneway semantics). */
+export function onewayLabel(oneway: number): string | null {
+  if (oneway === 1) return "one-way";
+  if (oneway === 2) return "one-way (reverse)";
+  return null;
+}
+
+/** Access-direction summary like carto's ::directions arrows. */
+export function directionLabel(oneway: number): string {
+  if (oneway === 1) return "→ forward only";
+  if (oneway === 2) return "← reverse only";
+  return "↔ both directions";
 }

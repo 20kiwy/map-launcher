@@ -1,0 +1,17 @@
+[package]
+name = "tile-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tile-server"
+path = "src/main.rs"
+
+[dependencies]
+tiny-skia = "0.11"
+fontdue = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+carto-math = { path = "../carto-math" }
+carto-style = { path = "../carto-style" }
+carto-core = { path = "../carto-core" }
