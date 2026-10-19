@@ -1024,6 +1024,64 @@ fn abs_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Resolve the data directory holding `store.bin` (+ `registry.json`).
+/// Priority: `--data-dir` flag > `MAP_LAUNCHER_DATA` env > `./data` (cwd) >
+/// `<exe dir>/data` > `<exe dir>` (flat release zip layout). The first
+/// candidate that actually contains `store.bin` wins; all searched paths are
+/// reported so a bare release binary tells the user exactly what to fix.
+fn resolve_data_dir(root: &PathBuf, flag: Option<String>) -> (PathBuf, Vec<PathBuf>) {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(d) = flag {
+        candidates.push(PathBuf::from(d));
+    }
+    if let Ok(v) = std::env::var("MAP_LAUNCHER_DATA") {
+        if !v.trim().is_empty() {
+            candidates.push(PathBuf::from(v.trim().to_string()));
+        }
+    }
+    candidates.push(root.join("data"));
+    if let Some(d) = exe_dir {
+        candidates.push(d.join("data"));
+        candidates.push(d);
+    }
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for c in candidates {
+        if !unique.contains(&c) {
+            unique.push(c);
+        }
+    }
+    let chosen = unique
+        .iter()
+        .find(|d| d.join("store.bin").is_file())
+        .cloned()
+        .unwrap_or_else(|| unique.first().cloned().unwrap_or_else(|| root.join("data")));
+    (chosen, unique)
+}
+
+/// Load the label font face: system scan first (craft-launcher style), then
+/// the build-machine bundled assets, then the DejaVu bytes embedded in this
+/// binary — the guaranteed fallback for bare release executables.
+fn load_font_face(bold: bool) -> (Font, String) {
+    let path = carto_style::load_map_font(bold).or_else(|| carto_style::find_font("dejavu", bold));
+    if let Some(p) = path {
+        match std::fs::read(&p) {
+            Ok(bytes) => match Font::from_bytes(bytes, FontSettings { scale: 12.0, ..Default::default() }) {
+                Ok(f) => return (f, p.display().to_string()),
+                Err(e) => eprintln!("font {} parse failed ({e}) — using embedded DejaVu", p.display()),
+            },
+            Err(e) => eprintln!("font {} unreadable ({e}) — using embedded DejaVu", p.display()),
+        }
+    }
+    let (name, bytes) = carto_style::embedded_font("DejaVu Sans", bold)
+        .expect("embedded DejaVu font missing (build corruption)");
+    let font = Font::from_bytes(bytes.to_vec(), FontSettings { scale: 12.0, ..Default::default() })
+        .expect("embedded font parse failed");
+    (font, format!("embedded:{name}"))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "extract" {
@@ -1064,11 +1122,16 @@ fn main() {
 
     // serve
     let mut port: u16 = 3100;
+    let mut data_flag: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--port" if i + 1 < args.len() => {
                 port = args[i + 1].parse().unwrap_or(3100);
+                i += 2;
+            }
+            "--data-dir" if i + 1 < args.len() => {
+                data_flag = Some(args[i + 1].clone());
                 i += 2;
             }
             _ => i += 1,
@@ -1077,38 +1140,49 @@ fn main() {
 
     let root = abs_root();
     let assets = root.join("assets");
-    let data_dir = root.join("data");
 
-    let palette = Palette::from_dir(assets.join("style")).unwrap_or_else(|e| {
-        eprintln!("palette load failed ({e}) — using empty palette");
-        Palette { decls: Vec::new(), vars: HashMap::new(), roles: Vec::new(), color_count: 0 }
-    });
+    // Palette: on-disk assets/style first (dev checkout), else the verbatim
+    // openstreetmap-carto style sheets embedded in this binary.
+    let style_dir = assets.join("style");
+    let (palette, palette_src) = if style_dir.is_dir() {
+        match Palette::from_dir(&style_dir) {
+            Ok(p) => (p, style_dir.display().to_string()),
+            Err(e) => {
+                eprintln!("palette load from {} failed ({e}) — using embedded openstreetmap-carto style", style_dir.display());
+                (Palette::from_embedded(), "embedded assets/style".to_string())
+            }
+        }
+    } else {
+        (Palette::from_embedded(), "embedded assets/style".to_string())
+    };
+    let symbols_dir = assets.join("symbols");
+    let symbol_reg = if symbols_dir.is_dir() {
+        SymbolRegistry::scan(&symbols_dir)
+    } else {
+        SymbolRegistry::embedded()
+    };
     eprintln!(
-        "palette: {} vars, {} colors, {} roles, {} symbols",
+        "palette[{}]: {} vars, {} colors, {} roles, {} symbols",
+        palette_src,
         palette.var_count(),
         palette.color_count,
         palette.roles.len(),
-        SymbolRegistry::scan(assets.join("symbols")).svg_count
+        symbol_reg.svg_count
     );
 
-    // Fonts: craft-launcher-style loader — system scan (Noto Sans first, the
-    // openstreetmap-carto fonts.mss choice), bundled assets/fonts fallback.
-    let regular_path = carto_style::load_map_font(false)
-        .or_else(|| carto_style::find_font("dejavu", false))
-        .expect("no map font found (system + assets/fonts)");
-    let bold_path = carto_style::load_map_font(true)
-        .or_else(|| carto_style::find_font("dejavu", true))
-        .expect("no bold map font found (system + assets/fonts)");
-    eprintln!("fonts: regular={} bold={}", regular_path.display(), bold_path.display());
-    let font_bytes = std::fs::read(&regular_path).expect("read regular font");
-    let font_bold_bytes = std::fs::read(&bold_path).expect("read bold font");
-    let font = Font::from_bytes(font_bytes, FontSettings { scale: 12.0, ..Default::default() })
-        .expect("font parse failed");
-    let font_bold = Font::from_bytes(font_bold_bytes, FontSettings { scale: 12.0, ..Default::default() })
-        .expect("font parse failed");
+    let (font, font_src) = load_font_face(false);
+    let (font_bold, font_bold_src) = load_font_face(true);
+    eprintln!("fonts: regular={} bold={}", font_src, font_bold_src);
 
+    let (data_dir, searched) = resolve_data_dir(&root, data_flag);
     let store = Store::load(&data_dir).unwrap_or_else(|e| {
-        eprintln!("store load failed ({e}) — empty registry (run: tile-server extract <pbf> data)");
+        eprintln!("store load failed ({e}) — empty registry");
+        eprintln!(
+            "  searched: {}",
+            searched.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+        eprintln!("  fix 1: unzip the map-data release asset so store.bin sits in one of those dirs");
+        eprintln!("  fix 2: tile-server extract <pbf> <data-dir> [w s e n]");
         Store::empty(carto_core::DODOMA_BBOX)
     });
     eprintln!(
@@ -1132,8 +1206,14 @@ fn main() {
         misses: AtomicUsize::new(0),
     });
 
-    let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind :3100");
-    eprintln!("map-launcher tile-server 0.3.0 listening on :{port}");
+    let listener = TcpListener::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
+        eprintln!("bind :{port} failed ({e}) — is another tile-server already running?");
+        std::process::exit(1);
+    });
+    eprintln!(
+        "map-launcher tile-server v{} listening on :{port}",
+        env!("CARGO_PKG_VERSION")
+    );
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {

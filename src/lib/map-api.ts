@@ -1,22 +1,25 @@
 /**
  * Shared types + helpers for the map-launcher preview UI.
  *
- * The Rust tile-server daemon listens on an internal port (3100) and is only
- * reachable from the browser through the gateway: relative URLs carrying the
- * `XTransformPort=3100` query param. Never use absolute URLs or other ports.
+ * All tile-server traffic uses same-origin Next.js API routes
+ * (src/app/api/** + src/app/tile/**) that proxy to the Rust daemon on
+ * 127.0.0.1:3100 (override with TILE_SERVER_URL). No gateway or absolute
+ * URLs involved, so the UI works identically:
+ *   - in the sandbox (Next dev server),
+ *   - in a local release deployment (Windows: tile-server.exe + the
+ *     standalone Next.js build via `node server.js`).
  */
 
 export const TILE_SERVER_PORT = 3100;
 
-/** Wrap a relative API path so the gateway forwards it to the tile server. */
+/** Same-origin API path — proxied by the Next.js tile-server routes. */
 export function gwUrl(path: string): string {
-  const sep = path.includes("?") ? "&" : "?";
-  return `${path}${sep}XTransformPort=${TILE_SERVER_PORT}`;
+  return path;
 }
 
-/** XYZ tile URL routed through the gateway. */
+/** XYZ tile URL — proxied by the Next.js tile route. */
 export function tileUrl(z: number, x: number, y: number): string {
-  return `/tile/${z}/${x}/${y}.png?XTransformPort=${TILE_SERVER_PORT}`;
+  return `/tile/${z}/${x}/${y}.png`;
 }
 
 /* ------------------------------------------------------------------ */

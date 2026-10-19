@@ -8,9 +8,33 @@
 //! Also hosts the semantic palette registry (roles -> @var -> color),
 //! the SVG/PNG symbol registry and the system font loader helpers.
 
+use include_dir::{Dir, DirEntry};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/* --------------------------------------------------------------------- */
+/* Embedded openstreetmap-carto assets                                     */
+/* --------------------------------------------------------------------- */
+//
+// The release executables are fully self-contained: every openstreetmap-carto
+// `.mss` style sheet, the whole SVG/PNG symbol set and the bundled DejaVu
+// fonts are compiled into the binary. A bare `tile-server.exe` therefore
+// boots with the complete Carto palette + symbols on any machine (e.g. a
+// Windows box with no repository checkout). An on-disk `assets/` directory
+// always takes precedence so development stays overridable.
+
+/// Verbatim `assets/style/*.mss` (openstreetmap-carto master).
+pub static EMBEDDED_STYLE: Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../assets/style");
+
+/// Verbatim `assets/symbols/**` (openstreetmap-carto SVG/PNG symbol set).
+pub static EMBEDDED_SYMBOLS: Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../assets/symbols");
+
+/// Verbatim `assets/fonts/*.ttf` (guaranteed fallback faces).
+pub static EMBEDDED_FONTS: Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../assets/fonts");
 
 /* --------------------------------------------------------------------- */
 /* Color model                                                             */
@@ -479,6 +503,29 @@ pub const ROLE_VARS: &[(&str, &str)] = &[
 ];
 
 impl Palette {
+    /// Parse MSS sources `(source name, text)` in import order and evaluate
+    /// all variables.
+    pub fn from_mss_sources<I>(sources: I) -> Palette
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut decls: Vec<VarDecl> = Vec::new();
+        for (src, text) in sources {
+            extract_vars(&text, &src, &mut decls);
+        }
+        Palette::from_decls(decls)
+    }
+
+    /// Palette from the style sheets embedded in this binary — the verbatim
+    /// openstreetmap-carto `assets/style` set. Lets a bare executable boot
+    /// with the full Carto palette (Windows release binaries, CI, tests).
+    pub fn from_embedded() -> Palette {
+        let mut sources: Vec<(String, String)> = Vec::new();
+        collect_embedded_mss(&EMBEDDED_STYLE, &mut sources);
+        sources.sort_by(|a, b| a.0.cmp(&b.0));
+        Palette::from_mss_sources(sources)
+    }
+
     /// Parse every `.mss` file in `dir` (sorted by name so cross-file var
     /// references resolve in import order) and evaluate all variables.
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> std::io::Result<Palette> {
@@ -488,14 +535,18 @@ impl Palette {
             .filter(|p| p.extension().map(|x| x == "mss").unwrap_or(false))
             .collect();
         files.sort();
-        let mut decls: Vec<VarDecl> = Vec::new();
+        let mut sources: Vec<(String, String)> = Vec::with_capacity(files.len());
         for f in &files {
-            let text = fs::read_to_string(f)?;
             let src = f.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            extract_vars(&text, &src, &mut decls);
+            let text = fs::read_to_string(f)?;
+            sources.push((src, text));
         }
-        // Evaluate with a growing var map. Multiple passes resolve forward
-        // references (a var used before its declaration) until fixpoint.
+        Ok(Palette::from_mss_sources(sources))
+    }
+
+    /// Shared evaluation: growing var map, multiple passes to resolve forward
+    /// references (a var used before its declaration) until fixpoint.
+    fn from_decls(decls: Vec<VarDecl>) -> Palette {
         let mut vars: HashMap<String, Rgba> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
         for _ in 0..4 {
@@ -530,7 +581,7 @@ impl Palette {
                 })
             })
             .collect();
-        Ok(Palette { decls, vars, roles, color_count: seen.len() })
+        Palette { decls, vars, roles, color_count: seen.len() }
     }
 
     pub fn var_count(&self) -> usize {
@@ -616,7 +667,31 @@ pub struct SymbolRegistry {
     pub png_count: usize,
 }
 
+/// Recursively collect `(relative path, text)` for embedded `.mss` files.
+fn collect_embedded_mss(dir: &Dir<'static>, out: &mut Vec<(String, String)>) {
+    for entry in dir.entries() {
+        match entry {
+            DirEntry::Dir(d) => collect_embedded_mss(d, out),
+            DirEntry::File(f) => {
+                if f.path().extension().map(|x| x == "mss").unwrap_or(false) {
+                    let text = f.contents_utf8().unwrap_or_default().to_string();
+                    out.push((f.path().display().to_string(), text));
+                }
+            }
+        }
+    }
+}
+
 impl SymbolRegistry {
+    /// Symbol registry from the embedded openstreetmap-carto symbol set
+    /// (works with a bare executable — no on-disk assets needed).
+    pub fn embedded() -> SymbolRegistry {
+        let mut reg = SymbolRegistry::default();
+        walk_embedded_symbols(&EMBEDDED_SYMBOLS, &mut reg);
+        reg.files.sort();
+        reg
+    }
+
     pub fn scan<P: AsRef<Path>>(root: P) -> SymbolRegistry {
         let mut reg = SymbolRegistry::default();
         let mut stack = vec![root.as_ref().to_path_buf()];
@@ -644,6 +719,29 @@ impl SymbolRegistry {
         }
         reg.files.sort();
         reg
+    }
+}
+
+/// Recursively walk the embedded symbol tree collecting svg/png entries.
+fn walk_embedded_symbols(dir: &Dir<'static>, reg: &mut SymbolRegistry) {
+    for entry in dir.entries() {
+        match entry {
+            DirEntry::Dir(d) => walk_embedded_symbols(d, reg),
+            DirEntry::File(f) => {
+                let ext = f.path().extension().map(|x| x.to_string_lossy().to_lowercase());
+                match ext.as_deref() {
+                    Some("svg") => {
+                        reg.svg_count += 1;
+                        reg.files.push(f.path().display().to_string());
+                    }
+                    Some("png") => {
+                        reg.png_count += 1;
+                        reg.files.push(f.path().display().to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -732,6 +830,9 @@ fn style_score(stem_lower: &str, bold: bool) -> i32 {
             } else {
                 6
             }
+        } else if norm.ends_with("bd") || norm.ends_with("b") {
+            // Windows short bold suffix: arialbd.ttf, tahomabd.ttf, segoeuib.ttf
+            5
         } else if norm.contains("black") || norm.contains("heavy") {
             3
         } else {
@@ -742,6 +843,8 @@ fn style_score(stem_lower: &str, bold: bool) -> i32 {
             6
         } else if norm.ends_with("wght") || norm.contains("variable") {
             5 // variable face: defaults to Regular
+        } else if norm.contains("bold") || norm.ends_with("bd") || norm.ends_with("b") {
+            1 // bold face requested as regular — last resort
         } else if norm.contains("italic") || norm.contains("oblique") {
             1
         } else if norm.contains("medium") || norm.contains("book") {
@@ -812,11 +915,63 @@ fn bundled_font(family: &str, bold: bool) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// (relative path, bytes) for every font embedded from assets/fonts.
+fn embedded_font_files() -> Vec<(&'static str, &'static [u8])> {
+    let mut out = Vec::new();
+    fn walk(dir: &Dir<'static>, out: &mut Vec<(&'static str, &'static [u8])>) {
+        for entry in dir.entries() {
+            match entry {
+                DirEntry::Dir(d) => walk(d, out),
+                DirEntry::File(f) => {
+                    let ext = f.path().extension().map(|x| x == "ttf" || x == "otf").unwrap_or(false);
+                    if ext {
+                        let name = f.path().to_str().unwrap_or_default();
+                        out.push((name, f.contents()));
+                    }
+                }
+            }
+        }
+    }
+    walk(&EMBEDDED_FONTS, &mut out);
+    out
+}
+
+/// Embedded face for `family` inside assets/fonts — the guaranteed fallback
+/// when neither the system scan nor the build-machine assets dir resolves
+/// (bare release executables, e.g. tile-server.exe on Windows).
+/// Returns `(file name, bytes)`.
+pub fn embedded_font(family: &str, bold: bool) -> Option<(&'static str, &'static [u8])> {
+    let family_norm = normalize_stem(family);
+    let mut best: Option<(i32, &'static str, &'static [u8])> = None;
+    for (name, bytes) in embedded_font_files() {
+        let stem = std::path::Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let norm = normalize_stem(stem);
+        if !stem_matches_family(&norm, &family_norm) {
+            continue;
+        }
+        let score = style_score(stem, bold);
+        if score > 0 && best.as_ref().is_none_or(|(b, _, _)| score > *b) {
+            best = Some((score, name, bytes));
+        }
+    }
+    best.map(|(_, name, bytes)| (name, bytes))
+}
+
 /// The map-label face: openstreetmap-carto fonts.mss order — Noto Sans first,
 /// then DejaVu Sans. System fonts preferred (craft-launcher style), bundled
-/// assets/fonts as the guaranteed fallback.
+/// assets/fonts as the guaranteed fallback. Windows ships neither Noto Sans
+/// nor DejaVu Sans, so the stock Windows faces are last-resort families
+/// before the embedded font bytes are used.
 pub fn load_map_font(bold: bool) -> Option<PathBuf> {
-    for family in ["Noto Sans", "DejaVu Sans"] {
+    const FAMILIES: &[&str] = if cfg!(target_os = "windows") {
+        &["Noto Sans", "DejaVu Sans", "Segoe UI", "Arial", "Tahoma"]
+    } else {
+        &["Noto Sans", "DejaVu Sans"]
+    };
+    for family in FAMILIES.iter().copied() {
         if let Some(p) = find_system_font(family, bold) {
             return Some(p);
         }
@@ -961,6 +1116,31 @@ Map { background-color: @land-color; }
         // must resolve (system scan, bundled assets fallback).
         assert!(load_map_font(false).is_some(), "no regular map font");
         assert!(load_map_font(true).is_some(), "no bold map font");
+    }
+
+    #[test]
+    fn embedded_palette_matches_carto() {
+        let pal = Palette::from_embedded();
+        assert!(pal.var_count() > 400, "vars={}", pal.var_count());
+        assert!(pal.color_count > 100, "colors={}", pal.color_count);
+        assert!(pal.roles.len() >= 50, "roles={}", pal.roles.len());
+        assert_eq!(pal.get("land-color"), Some(Rgba::rgb(0xf2, 0xef, 0xe9)));
+        assert_eq!(pal.get("water-color"), Some(Rgba::rgb(0xaa, 0xd3, 0xdf)));
+        assert_eq!(pal.get("motorway-fill"), Some(Rgba::rgb(0xe8, 0x92, 0xa2)));
+        assert_eq!(pal.get("motorway-casing"), Some(Rgba::rgb(0xdc, 0x2a, 0x67)));
+    }
+
+    #[test]
+    fn embedded_symbols_and_fonts() {
+        let reg = SymbolRegistry::embedded();
+        assert!(reg.svg_count > 500, "svg={}", reg.svg_count);
+        assert!(reg.png_count > 5, "png={}", reg.png_count);
+        let (name, bytes) = embedded_font("DejaVu Sans", false).expect("embedded regular");
+        assert!(name.ends_with("DejaVuSans.ttf"), "name={name}");
+        assert!(bytes.len() > 100_000);
+        let (bold_name, bold_bytes) = embedded_font("DejaVu Sans", true).expect("embedded bold");
+        assert!(bold_name.ends_with("DejaVuSans-Bold.ttf"), "name={bold_name}");
+        assert!(bold_bytes.len() > 100_000);
     }
 
     #[test]

@@ -44,7 +44,28 @@ curl -L -C - -o data/tanzania-latest.osm.pbf \
 
 `scripts/dev.sh` chains build → extract-on-first-run → serve.
 
-## API (tile-server, gateway route `XTransformPort=3100`)
+## Releases (run on Windows / Linux without building)
+
+Tagged releases (`v*`) are built by `.github/workflows/release.yml` on
+**both** ubuntu-latest and windows-latest and publish a GitHub Release with:
+
+| Asset | Contents |
+| --- | --- |
+| `tile-server-vX-windows-x64.zip` | `tile-server.exe` + README — **self-contained**: full openstreetmap-carto palette, symbols and DejaVu fonts are embedded in the binary |
+| `tile-server-vX-linux-x64.tar.gz` | same for Linux |
+| `map-launcher-web-vX.zip` | standalone Next.js preview UI — run `node server.js` (Node 20+) |
+| `map-data-vX.zip` | Central Tanzania / Dodoma `store.bin` + `registry.json` — unzip into `data\` next to the exe |
+| `*.sha256` | checksums |
+
+Windows quickstart: unzip the three assets into one folder, double-click
+`tile-server.exe`, then `node server.js` inside `web\`, open
+<http://localhost:3000>. The web UI proxies tile-server traffic through its
+own API routes (`/api/*`, `/tile/*`), so no gateway is needed locally.
+
+## API (tile-server :3100)
+
+Same endpoints are available through the Next.js proxy routes
+(`/api/*`, `/tile/*` — used by the preview UI) and directly from the daemon:
 
 - `GET /api/stats` — registry counts + bbox
 - `GET /api/roads?limit=N` — roads registry (named first, includes `oneway`, `lanes`, `maxspeed`)
@@ -64,11 +85,23 @@ curl -L -C - -o data/tanzania-latest.osm.pbf \
   (`darken(casing, 10–40%)`), flipped for `oneway = -1`
 - POI dots + labels, deep zoom to z19 with zoom-continuing width ramps
 
+## Embedded assets
+
+Release binaries boot anywhere (no repository checkout): `carto-style`
+embeds the verbatim `assets/style/*.mss` (19 openstreetmap-carto style
+sheets), the full `assets/symbols` tree and the DejaVu fonts with
+`include_dir`. An on-disk `assets/` directory always takes precedence so
+development stays overridable. Font loading follows the craft-launcher
+pattern with per-OS system scans (Windows falls back to Segoe UI / Arial
+before the embedded DejaVu bytes).
+
 ## CI
 
 `.github/workflows/build.yml` builds and tests the whole Rust workspace on
 **ubuntu-latest** and **windows-latest** (submodules checked out recursively,
 release binaries uploaded as artifacts) and lints/builds the Next.js UI.
+`.github/workflows/release.yml` builds the tagged releases (Linux + Windows
+binaries + standalone web bundle) and publishes them to GitHub Releases.
 
 ## Screenshots
 

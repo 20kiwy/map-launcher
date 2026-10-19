@@ -33,6 +33,20 @@ export async function GET() {
     return NextResponse.json({ ok: true, spawned: false, state: "online" });
   }
 
+  // Windows release deployments start tile-server.exe manually (no bash /
+  // cargo toolchain to spawn) — surface a clear state instead of spawning.
+  if (process.platform === "win32") {
+    return NextResponse.json(
+      {
+        ok: false,
+        spawned: false,
+        state: "offline",
+        hint: "start tile-server.exe first (see the release README)",
+      },
+      { status: 503 },
+    );
+  }
+
   const now = Date.now();
   if (now - lastSpawnAt > 10_000) {
     lastSpawnAt = now;

@@ -61,4 +61,5 @@ server.log
 !/mini-services/map-launcher/data/registry.json
 /tests
 /db
-/agent-ctxtool-results/
+/agent-ctx
+/tool-results/
