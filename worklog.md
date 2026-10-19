@@ -143,3 +143,25 @@ Stage Summary:
 - Repo 20kiwy/map-launcher is PUBLIC: free unlimited GitHub Actions builds on standard Linux/Windows runners
 - Release v0.4.0 downloadable by anyone without auth (browser-verified via HTML + HEAD)
 - Old exposed token is now dead (auto-revoked by GitHub) -> rotate/replace only when a push is needed next (history purge of tool-results/ pending; needs a fresh token)
+
+---
+Task ID: 19
+Agent: Z.ai Code (main)
+Task: v0.5.0 — turn the tile-server into a desktop app (egui) with craft-launcher-style Tanzania downloads, a vectorcraft-style layer engine panel on the Map tab, plus tile-server-cli and the web UI; reference repos cloned as submodules in clone/.
+
+Work Log:
+- Research: read craft-launcher's download model (JobPhase: Downloading/Reconnecting/Verifying/Installing, catalog cards, primary action states) and vectorcraft's panels/layers.rs (eye+lock columns 25px, colour bar 4px/2px, chevron, ROW 20/26/40, show_rows, search+filter) — the two reference UIs to copy
+- Cloned storytold/vectorcraft to /home/z/clone for study; later added both as repo submodules: clone/craft-launcher (moved from vendor/, gitmodules updated) + clone/vectorcraft
+- Restructured the workspace: crates/tile-server-core (engine lib: renderer + HTTP + layer engine + downloads + server lifecycle), crates/tile-server-cli (headless serve/extract + new fetch subcommand), crates/tile-server (eframe 0.36 GUI); App.store moved to RwLock for runtime region switching; LayerVis overrides (visible/opacity/zoom/colour) plumbed through every render stage; /api/layers endpoint added
+- GUI (egui 0.36 API: App::ui/logic split, Panel::left/right, corner_radius, all_styles_mut): left rail with logo + tabs + live dot; Map tab = toolbar (server toggle, URL+copy, stats, region) + tile canvas (pan/wheel z4-19, zoom buttons, badges, attribution) + right Layers panel (painted eye column, colour bars, chevron triangles, kind chips, zoom badges, search, show/hide all, select -> ENGINE LAYER PROPERTIES: vector path, fill hex, opacity slider, zoom range steppers); Downloads tab = custom PBF URL row + Tanzania cards (whole country + 5 regions, pills, progress, source URL + Copy URL, Download/Cancel/Use this region); toast overlays; --screenshot <dir> captures both tabs headlessly via ViewportCommand::Screenshot (gl read_pixels under xvfb gave black frames — eframe's own screenshot path reads the real painted frame)
+- Downloads engine (download.rs): ureq 3 + rustls, Progress ticking (250ms), Reconnecting with Range resume (6 attempts), Extracting -> Installed with counts, cancel flags; regions catalog with shared tanzania PBF cache in data/downloads; GUI swaps the store into the running server when a region finishes (poll detects Installed transition)
+- Sandbox workarounds: rustup reinstall (toolchain wiped), libxkbcommon-x11 + libxcb-xkb1 debs extracted to /home/z/x11-libs for xvfb runs, background processes must run inside the same tool call (setsid dies), Tanzania PBF (706MB) downloaded via resumable curl inside one call, Dodoma re-extracted (116,443 roads / 530,815 buildings / 3,085 POIs, store.bin 89MB)
+- Verification: cargo build + 19/19 tests green; xvfb screenshots of both tabs with real Dodoma tiles; tile-server-cli serve -> /api/health, /api/stats, /api/layers, /tile/10/507/493.png (200, 2837b), /api/roads all OK; fetch subcommand end-to-end with a small PBF (download+extract, found+fixed missing create_dir_all); agent-browser: web UI renders map + roads registry + road click polyline against the v0.5.0 engine, no console errors; bun lint clean
+- release.yml: both binaries (tile-server.exe + tile-server-cli.exe in the win zip, both in the linux tar) + web bundle + data pack; README-RELEASE rewritten for the 3-product story; versions bumped to 0.5.0 everywhere
+- Screenshots: screenshots/v0.5.0/{01-map-tab-layer-engine,02-downloads-tab-tanzania,03-web-ui-v05-engine}.png
+
+Stage Summary:
+- Three products: tile-server (GUI+server), tile-server-cli (headless), map-launcher-web (Next.js) — all from one engine crate
+- Layer engine UI copied from vectorcraft (eye column, colour bars, chevrons, properties editor) and downloads copied from craft-launcher (phase cards, resume, region catalog) — both reference repos are now submodules under clone/
+- Tanzania downloads work for parts (shared PBF crop) and the whole country via URL, plus any custom PBF URL
+- NOT pushed: the old GitHub token was auto-revoked; pushing + tagging v0.5.0 needs a fresh token from the user
