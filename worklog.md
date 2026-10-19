@@ -165,3 +165,25 @@ Stage Summary:
 - Layer engine UI copied from vectorcraft (eye column, colour bars, chevrons, properties editor) and downloads copied from craft-launcher (phase cards, resume, region catalog) — both reference repos are now submodules under clone/
 - Tanzania downloads work for parts (shared PBF crop) and the whole country via URL, plus any custom PBF URL
 - NOT pushed: the old GitHub token was auto-revoked; pushing + tagging v0.5.0 needs a fresh token from the user
+
+---
+Task ID: 20
+Agent: Z.ai Code (main)
+Task: With the fresh GitHub token — purge the leaked token from git history, push + tag v0.5.0 (release build), re-capture the v0.5.0 screenshots the sandbox wiped, and verify the release end-to-end.
+
+Work Log:
+- Verified new token (login 20kiwy, repo public, push scope OK)
+- Secret scan of every commit (ghp_/github_pat_ patterns): exactly one file — tool-results/bash_1792414990068_*.txt in 2 commits; deleted it from the worktree; git filter-branch --index-filter 'git rm -r --cached --ignore-unmatch tool-results' --prune-empty --tag-name-filter cat -- --all rewrote main + v0.4.0 tag; refs/original removed, reflog expired, gc --prune=now; re-scan across all refs = clean (pack 6.5 MiB)
+- Push fix: origin remote URL still embedded the OLD token (broke credential lookup) -> reset to clean URL, credential.helper store with the new token in ~/.git-credentials (outside the repo)
+- Force-pushed rewritten history: main 09c3e58 -> 38ec694 (carries v0.5.0 commits a481729 + 38ec694), v0.4.0 tag re-pushed at rewritten SHA
+- Tagged v0.5.0 on HEAD and pushed -> release run 39338509801 completed SUCCESS
+- Release v0.5.0 verified via authed API: tile-server-v0.5.0-windows-x64.zip 12.9MB (GUI app + tile-server-cli), tile-server-v0.5.0-linux-x64.tar.gz 14.3MB, map-launcher-web-v0.5.0.zip 30.2MB + sha256s; map-data pack intentionally dropped in v0.5.0 (Downloads tab now fetches Tanzania PBFs from source URLs, craft-launcher flow)
+- Sandbox wipe recovery: rust toolchain needed PATH only; rebuilt release tile-server; port 3100 had a stale debug tile-server-cli (killed)
+- Fixed xvfb black-frame captures for good: eframe Event::Screenshot returns a cleared buffer under glow/xvfb -> new save_tab_screenshot() prefers an ffmpeg x11grab of the X11 ROOT window (real screen content), falling back to the eframe image; in --screenshot mode the window now fills the virtual screen at 0,0 (MAP_LAUNCHER_SHOT_SIZE, default 1600x1000); also fixed unused `frame` warning
+- Re-captured + committed screenshots/v0.5.0/: 01-map-tab-layers.png (Map tab: server toggle, live URL + Copy, 116,443 roads stats, Dodoma tiles z12, vectocraft-style Layers panel with eye column / colour bars / kind chips / zoom badges), 02-downloads-tab.png (Tanzania whole-country + 5 region cards with bbox, source URL + Copy URL, Download, custom PBF URL row), 03-web-ui-v05-engine.png (agent-browser against tile-server-cli serve :3100 + Next dev: stats chips, live tiles, roads registry; road click OK, no console errors)
+- Pushed screenshots + capture fix as d2c5a4d; build CI queued on main
+
+Stage Summary:
+- Git history is token-free forever (leaked file purged from every commit; scans clean) and the new token is only in ~/.git-credentials outside the repo
+- v0.5.0 is live: https://github.com/20kiwy/map-launcher/releases/tag/v0.5.0 with the three-product build (tile-server GUI+server / tile-server-cli / map-launcher-web)
+- Screenshot tooling is deterministic now (X11 root grab), screenshots versioned and committed
