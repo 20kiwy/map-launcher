@@ -79,11 +79,25 @@ fn main() -> eframe::Result<()> {
     let stack = load_stack(data_flag);
     stack.log();
     let app = tile_server_core::app_from_stack(stack);
+    // Screenshot mode: size the window to fill the Xvfb screen at 0,0 so a
+    // root-window grab captures exactly the app.
+    let shot_size = screenshot.as_ref().map(|_| {
+        let s = std::env::var("MAP_LAUNCHER_SHOT_SIZE").unwrap_or_else(|_| "1600x1000".into());
+        let mut it = s.split('x');
+        (
+            it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1600.0),
+            it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1000.0),
+        )
+    });
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(format!("map-launcher tile-server {}", tile_server_core::VERSION))
+        .with_min_inner_size([980.0, 620.0]);
+    viewport = match shot_size {
+        Some((w, h)) => viewport.with_inner_size([w, h]).with_position([0.0, 0.0]),
+        None => viewport.with_inner_size([1280.0, 800.0]),
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("map-launcher tile-server {}", tile_server_core::VERSION))
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([980.0, 620.0]),
+        viewport,
         persist_window: false,
         ..Default::default()
     };
@@ -262,7 +276,7 @@ impl Shell {
 }
 
 impl eframe::App for Shell {
-    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Live job polling + auto store swap on completion.
         self.downloads.poll(ctx, &self.app, &self.data_version);
 
@@ -287,7 +301,7 @@ impl eframe::App for Shell {
                 }
                 1 => {
                     if let Some(img) = take_screenshot_event(ctx) {
-                        save_color_image(&img, &capture.dir.join("01-map-tab-layers.png"));
+                        save_tab_screenshot(&capture.dir, "01-map-tab-layers.png", Some(&img));
                         eprintln!("screenshot saved: 01-map-tab-layers.png");
                         self.tab = Tab::Downloads;
                         capture.stage = 2;
@@ -307,7 +321,7 @@ impl eframe::App for Shell {
                 }
                 3 => {
                     if let Some(img) = take_screenshot_event(ctx) {
-                        save_color_image(&img, &capture.dir.join("02-downloads-tab.png"));
+                        save_tab_screenshot(&capture.dir, "02-downloads-tab.png", Some(&img));
                         eprintln!("screenshot saved: 02-downloads-tab.png");
                         capture.stage = 4;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1182,6 +1196,38 @@ fn take_screenshot_event(ctx: &egui::Context) -> Option<egui::ColorImage> {
             _ => None,
         })
     })
+}
+
+/// Save the current tab: prefer a real X11 root-window grab (ffmpeg x11grab) —
+/// under xvfb eframe's own screenshot can come back as a cleared buffer —
+/// falling back to the in-process frame it captured.
+fn save_tab_screenshot(
+    dir: &std::path::Path,
+    name: &str,
+    fallback: Option<&egui::ColorImage>,
+) {
+    let _ = std::fs::create_dir_all(dir);
+    let path = dir.join(name);
+    if x11_grab_png(&path).is_some() {
+        return;
+    }
+    eprintln!("x11 grab unavailable, saving eframe frame buffer");
+    if let Some(img) = fallback {
+        save_color_image(img, &path);
+    }
+}
+
+/// Grab the X11 root window (the whole virtual screen) to a PNG via ffmpeg.
+fn x11_grab_png(path: &std::path::Path) -> Option<()> {
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+    let size = std::env::var("MAP_LAUNCHER_SHOT_SIZE").unwrap_or_else(|_| "1600x1000".into());
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "x11grab", "-video_size"])
+        .args([size.as_str(), "-i", display.as_str(), "-frames:v", "1"])
+        .arg(path.as_os_str())
+        .status()
+        .ok()?;
+    status.success().then_some(())
 }
 
 /// Save a straight-alpha ColorImage as a PNG.
