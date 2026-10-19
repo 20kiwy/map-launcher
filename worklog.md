@@ -127,3 +127,19 @@ Stage Summary:
 - Release binaries are self-contained: full openstreetmap-carto palette+symbols+fonts embedded; bare exe boots anywhere
 - Web UI proxy architecture works without the sandbox gateway -> local Windows deployments run tile-server.exe + node server.js
 - NOTE: GitHub token remains exposed in chat history — rotate it
+
+---
+Task ID: 18
+Agent: Z.ai Code (main)
+Task: Make the GitHub repo public so workflow builds run free (unlimited Actions minutes on standard runners).
+
+Work Log:
+- Verified repo state: tag v0.4.0 on origin, release.yml committed, pending local diffs were sandbox mode-only noise (100644->100755); set core.fileMode=false
+- PATCH /repos/20kiwy/map-launcher {"private": false} -> success; verified via API ("visibility": "public") AND unauthenticated git ls-remote (repo readable anonymously)
+- GitHub secret scanning auto-revoked the old ghp_ token (it sat in tool-results/ files committed earlier in history) -> "Bad credentials" on subsequent authed calls; unauthenticated API rate-limited, so release/CI verified via public HTML endpoints instead
+- Confirmed release v0.4.0 fully public: expanded_assets page lists tile-server-v0.4.0-windows-x64.zip (4.2MB), tile-server-v0.4.0-linux-x64.tar.gz, map-launcher-web-v0.4.0.zip (30.3MB), map-data-v0.4.0.zip (39.9MB) + sha256s; Content-Length headers verified by unauthenticated HEAD
+
+Stage Summary:
+- Repo 20kiwy/map-launcher is PUBLIC: free unlimited GitHub Actions builds on standard Linux/Windows runners
+- Release v0.4.0 downloadable by anyone without auth (browser-verified via HTML + HEAD)
+- Old exposed token is now dead (auto-revoked by GitHub) -> rotate/replace only when a push is needed next (history purge of tool-results/ pending; needs a fresh token)
