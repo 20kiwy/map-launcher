@@ -77,3 +77,29 @@ Stage Summary:
 - Palette engine matches openstreetmap-carto: land #f2efe9, water #aad3df, motorway #e892a2/#dc2a67, forest #add19e, farmland #eef0d5, building #d9d0c9
 - API contract intact: /api/stats /api/roads?limit /api/roads/:id /api/pois?limit /api/palette /tile/z/x/y.png (+ /api/health)
 - NOTE: egui launcher + xvfb screenshot tour not rebuilt after reset (screenshots strip degrades gracefully; v0.2.0 holds UI verification captures) — can be re-added on request
+
+---
+Task ID: 16
+Agent: Z.ai Code (main)
+Task: Push to private GitHub repo with submodules + Linux/Windows CI; deep zoom; craft-launcher-style fonts; oneway/lanes road directions
+
+Work Log:
+- Cloned craft-launcher (storytold/craft-launcher, main) into vendor/, studied font import: bundled variable body font (include_bytes Inter) + per-OS system font scan (Windows %SystemRoot%\Fonts, macOS /System/Library/Fonts, Linux /usr/share/fonts) with family-name matching via skrifa + FontTweak baseline alignment -> replicated the pattern in carto-style
+- carto-style: new font module — system_font_dirs() per-OS, normalize_stem/stem_matches_family (prefix match, excludes mono/serif/script-specific), style_score (Regular/Bold preference), find_system_font(), load_map_font() with openstreetmap-carto fonts.mss order (Noto Sans -> DejaVu Sans -> bundled assets/fonts); CARGO_MANIFEST_DIR-based bundled path so CI/Windows always resolves
+- carto-core: Line gains oneway:u8 (0/1/2 for yes/-1), lanes:u8, maxspeed:u16; extractor reads OSM tags (oneway/lanes/maxspeed incl. "50|60" lists); +tests
+- tile-server: road_width ramps extended to z19 (13-entry tables), tile_route z<=19, oneway direction arrows from z16 exactly per roads.mss ::directions (symbols/oneway.svg semantics: 180px spacing along line, per-class @*-oneway-arrow-color = darken(casing,10-40%), flipped for oneway=-1, drawn under labels), label caps scale with zoom (24+z*12), RoadSummary/RoadDetail DTOs + /api/roads include oneway/lanes/maxspeed, fonts loaded via load_map_font with startup log, version 0.3.0
+- Rebuilt workspace (0 warnings), 17 tests green; re-extracted tanzania-latest.pbf -> store.bin: 116,443 roads (1,304 named), 530,815 buildings, 3,085 POIs, 4.93M nodes; registry now carries 157 oneway/177 laned/56 maxspeed roads in first 50k
+- NOTE: first nohup extract attempt died silently (session reaper/OOM) — foreground rerun with long timeout worked
+- Frontend: MAX_Z 16->19, RoadInfoBar under map (name/class/direction/lanes/maxspeed/length + one-way badge), road rows show "· one-way · N lanes · 50 km/h", map-api.ts adds onewayLabel/directionLabel
+- Browser-verified via gateway :81: stats chips 116,443 roads, roads registry + search ("Arusha" -> one-way/2-lanes rows), road select -> accent polyline + RoadInfoBar "direction -> forward only", zoomed to z19 HUD, oneway arrows visible on trunk carriageways, overview renders rivers/rail/urban carto palette
+- Captured screenshots/v0.3.0/{01-preview-z19-oneway-arrows,02-preview-mobile-z19,03-preview-dodoma-overview}.png
+- Git: .gitignore un-ignores mini-services source (target/ + data/* except registry.json still out); README.md; .github/workflows/build.yml (matrix ubuntu-latest+windows-latest: checkout submodules recursive, dtolnay/rust-toolchain, Swatinem/rust-cache, cargo build --release --workspace + test, upload tile-server/-exe artifacts; separate bun lint+build job for the UI)
+- Submodules: vendor/openstreetmap-carto + vendor/craft-launcher (--depth 1) via git submodule add
+- GitHub: token verified as user 20kiwy; POST /user/repos -> private repo 20kiwy/map-launcher; pushed main (2 commits); untracked stray .env + tool-results/ from earlier history and force-pushed... no, normal push of removal commit
+- CI result: run 39184053104 = SUCCESS — rust windows-latest 2m21s, rust ubuntu-latest 1m29s, next.js ui 40s, all green
+
+Stage Summary:
+- Private repo live: https://github.com/20kiwy/map-launcher (private), origin remote configured
+- App: deep zoom z5-19 working end-to-end; oneway arrows + lanes/maxspeed in tiles, registry API and UI; craft-launcher-style system fonts (Noto Sans first per fonts.mss)
+- CI green on Linux AND Windows building all 4 crates + UI; binaries as artifacts
+- Screenshots versioned v0.2.0 + v0.3.0 in repo
