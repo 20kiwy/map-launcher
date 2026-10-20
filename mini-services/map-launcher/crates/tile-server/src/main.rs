@@ -26,11 +26,14 @@ use egui::text::LayoutJob;
 use egui::viewport::ResizeDirection;
 use egui::{Align, Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Frame, Layout, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 use tile_server_core::download::{pbf_name_for, Manager, Phase, Region, RegionReq};
-use tile_server_core::layers::{layer_catalog, LayerDef, LayerVis};
+use tile_server_core::layers::{children_of, descendants_of, layer_catalog, top_ancestor_of, LayerDef, LayerVis};
 use tile_server_core::{bind_error_hint, load_stack, render_tile_pixmap, spawn_server, App, ServerHandle};
 
 mod settings;
 use settings::Settings;
+
+mod annotations;
+use annotations::Anno;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -100,16 +103,21 @@ fn main() -> eframe::Result<()> {
     stack.log();
     let app = tile_server_core::app_from_stack(stack);
 
-    // Screenshot mode: size the window to fill the Xvfb screen at 0,0 so a
-    // root-window grab captures exactly the app.
-    let shot_size = screenshot.as_ref().map(|_| {
-        let s = std::env::var("MAP_LAUNCHER_SHOT_SIZE").unwrap_or_else(|_| "1600x1000".into());
-        let mut it = s.split('x');
-        (
-            it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1600.0),
-            it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1000.0),
-        )
-    });
+    // Screenshot mode / driver scripts: size the window to fill the Xvfb
+    // screen at 0,0 so a root-window grab captures exactly the app
+    // (MAP_LAUNCHER_SHOT_SIZE=WxH; also honoured without --screenshot so
+    // automation tools see a deterministic layout).
+    let shot_size = {
+        let want = screenshot.is_some() || std::env::var("MAP_LAUNCHER_SHOT_SIZE").is_ok();
+        want.then(|| {
+            let s = std::env::var("MAP_LAUNCHER_SHOT_SIZE").unwrap_or_else(|_| "1600x1000".into());
+            let mut it = s.split('x');
+            (
+                it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1600.0),
+                it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1000.0),
+            )
+        })
+    };
     // The header is the title bar (craft-launcher): a frameless window.
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("map-launcher tile-server {}", tile_server_core::VERSION))
@@ -716,6 +724,9 @@ struct Shell {
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     map: MapState,
     layers: PanelState,
+    /// User-drawn polygons/paths, shown in the Layers tree and persisted in
+    /// the config dir.
+    annos: Vec<Anno>,
     downloads: DownloadsState,
     toast: Option<(String, Instant, Color32)>,
     capture: Option<Capture>,
@@ -749,6 +760,7 @@ impl Shell {
             folder_rx: None,
             map,
             layers: PanelState::default(),
+            annos: annotations::load(),
             downloads: DownloadsState::new(),
             toast: None,
             capture: screenshot.map(|dir| Capture { dir, frames: 0, stage: 0 }),
@@ -858,7 +870,8 @@ impl eframe::App for Shell {
                 .show(ui, |ui| {
                     let r = ui.max_rect();
                     ui.painter().vline(r.left(), r.y_range(), theme::hairline());
-                    self.layers.panel_ui(ui, &self.app, &self.data_version);
+                    let Shell { app, layers, annos, map, data_version, workspace, .. } = self;
+                    layers.panel_ui(ui, app, data_version, annos, map, workspace);
                 });
         }
 
@@ -1112,16 +1125,57 @@ impl Shell {
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let region = self.app.region_name.lock().unwrap().clone();
-                widgets::hud_elided(ui, &region, t.ink, 240.0);
+                widgets::hud_elided(ui, &region, t.ink, 180.0);
+                ui.add_space(10.0);
+
+                // Canvas tools (SELECT | POLYGON | PATH) — the same hard
+                // cells the header tabs use; drawing state lives on MapState.
+                // (Inside the right-to-left layout, so they sit left of the
+                // region label; reversed to read left-to-right.)
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (label, tool) in [(Tool::Path.label(), Tool::Path), (Tool::Polygon.label(), Tool::Polygon), (Tool::Select.label(), Tool::Select)] {
+                    let selected = self.map.tool == tool;
+                    let galley = widgets::caps(ui, label, HUD_SIZE - 1.0, theme::mono_bold(), BUTTON_SPACING, t.ink);
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 22.0, CONTROL_H - 2.0), Sense::click());
+                    let (fill, ink, stroke) = if selected {
+                        (t.invert_bg, t.invert_fg, Stroke::new(1.0, t.invert_bg))
+                    } else if resp.hovered() {
+                        (t.sunken, t.ink_strong, theme::hairline())
+                    } else {
+                        (t.bg, t.muted, theme::hairline())
+                    };
+                    ui.painter().rect(rect, CornerRadius::ZERO, fill, stroke, egui::StrokeKind::Inside);
+                    paint_cell_centred(ui, rect, galley, ink);
+                    if resp.clicked() {
+                        self.map.tool = tool;
+                        if tool != Tool::Select {
+                            self.map.work.clear();
+                        }
+                    }
+                    ui.add_space(2.0);
+                }
+                ui.add_space(6.0);
             });
         });
-        ui.add_space(8.0);
+        if self.map.tool != Tool::Select {
+            widgets::hud(
+                ui,
+                match self.map.tool {
+                    Tool::Polygon => "polygon — click: add point · click the first point / Enter: close · Backspace: undo · Esc: cancel · right-drag: pan",
+                    _ => "path — click: add point · Enter / double-click: finish · Backspace: undo · Esc: cancel · right-drag: pan",
+                },
+                t.accent_ink,
+            );
+            ui.add_space(2.0);
+        }
+        ui.add_space(6.0);
 
         self.notices_ui(ui);
 
         // Canvas fills the rest (the layers live in the right-side panel).
+        let Shell { app, map, annos, layers, data_version, port, .. } = self;
         egui::Frame::new().fill(t.bg).stroke(theme::hairline()).show(ui, |ui| {
-            self.map.canvas_ui(ui, &self.app, &self.data_version, self.port);
+            map.canvas_ui(ui, app, data_version, *port, annos, &mut layers.selected);
         });
     }
 
@@ -1592,12 +1646,46 @@ fn thousands(n: usize) -> String {
 /* Map canvas                                                              */
 /* --------------------------------------------------------------------- */
 
+/// The selected row of the Layers panel — an engine layer id or a drawing.
+#[derive(Clone, Debug, PartialEq)]
+enum Sel {
+    Layer(String),
+    Anno(usize),
+}
+
+/// The Map canvas tools: pan/select, or the pen tools that draw annotations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tool {
+    Select,
+    Polygon,
+    Path,
+}
+
+impl Tool {
+    fn label(self) -> &'static str {
+        match self {
+            Tool::Select => "Select",
+            Tool::Polygon => "Polygon",
+            Tool::Path => "Path",
+        }
+    }
+}
+
 struct MapState {
     /// Fractional zoom (4..=19).
     zoom: f32,
     /// Center lon/lat.
     center: (f64, f64),
     tex: HashMap<(u8, u32, u32), (TextureHandle, u64)>,
+    /// The active canvas tool (also switched from the toolbar and the Layers
+    /// panel's new-drawing buttons).
+    tool: Tool,
+    /// In-progress pen vertices (lon, lat).
+    work: Vec<(f64, f64)>,
+    /// An annotation being moved whole.
+    move_drag: Option<usize>,
+    /// The canvas rect last frame (fit-to-selection, hit tests).
+    last_rect: Option<Rect>,
 }
 
 impl MapState {
@@ -1606,29 +1694,197 @@ impl MapState {
             zoom: 12.0,
             center: ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0),
             tex: HashMap::new(),
+            tool: Tool::Select,
+            work: vec![],
+            move_drag: None,
+            last_rect: None,
         }
     }
 
-    fn canvas_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>, data_version: &Arc<AtomicU64>, port: u16) {
+    fn z(&self) -> u8 {
+        self.zoom.round().clamp(4.0, 19.0) as u8
+    }
+
+    /// lon/lat → canvas pixel.
+    fn project(&self, rect: Rect, lon: f64, lat: f64) -> Pos2 {
+        let world = world_px(self.z()) as f64;
+        let (cx_m, cy_m) = lonlat_to_merc(self.center.0, self.center.1);
+        let tl = (cx_m * world - rect.width() as f64 / 2.0, cy_m * world - rect.height() as f64 / 2.0);
+        let (mx, my) = lonlat_to_merc(lon, lat);
+        Pos2::new((mx * world - tl.0) as f32 + rect.left(), (my * world - tl.1) as f32 + rect.top())
+    }
+
+    /// Canvas pixel → lon/lat.
+    fn unproject(&self, rect: Rect, p: Pos2) -> (f64, f64) {
+        let world = world_px(self.z()) as f64;
+        let (cx_m, cy_m) = lonlat_to_merc(self.center.0, self.center.1);
+        let tl = (cx_m * world - rect.width() as f64 / 2.0, cy_m * world - rect.height() as f64 / 2.0);
+        let mx = ((p.x as f64 - rect.left() as f64 + tl.0) / world).clamp(0.0, 1.0);
+        let my = ((p.y as f64 - rect.top() as f64 + tl.1) / world).clamp(0.0, 1.0);
+        merc_to_lonlat(mx, my)
+    }
+
+    /// Center + zoom so `bbox` fits the canvas.
+    fn fit_bbox(&mut self, rect: Rect, bbox: [f64; 4]) {
+        let (x0, y0) = lonlat_to_merc(bbox[0], bbox[3]);
+        let (x1, y1) = lonlat_to_merc(bbox[2], bbox[1]);
+        self.center = merc_to_lonlat((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let w = (x1 - x0).abs().max(1e-9);
+        let h = (y1 - y0).abs().max(1e-9);
+        let fit = ((rect.width() as f64 * 0.8) / w).min((rect.height() as f64 * 0.8) / h);
+        self.zoom = ((fit / 256.0).log2() as f32).clamp(4.0, 19.0);
+    }
+
+    /// Frame an annotation in view.
+    fn fit_annotation(&mut self, rect: Rect, a: &Anno) {
+        if a.pts.is_empty() {
+            return;
+        }
+        let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        for &(lon, lat) in &a.pts {
+            b = [b[0].min(lon), b[1].min(lat), b[2].max(lon), b[3].max(lat)];
+        }
+        self.fit_bbox(rect, b);
+    }
+
+    /// Whether pointer `p` is over annotation `a` (inside a polygon, or near
+    /// the stroke of either kind).
+    fn anno_hit(&self, rect: Rect, a: &Anno, p: Pos2) -> bool {
+        let pts: Vec<Pos2> = a.pts.iter().map(|&(lon, lat)| self.project(rect, lon, lat)).collect();
+        if a.kind == "polygon" && pts.len() >= 3 && point_in_poly(&pts, p) {
+            return true;
+        }
+        let w = (a.width.max(2.0) * 2.5).clamp(6.0, 14.0);
+        pts.windows(2).any(|s| dist_pt_seg(p, s[0], s[1]) <= w)
+    }
+
+    /// Close the pen: turn the work vertices into an annotation, select it
+    /// and go back to Select.
+    fn finish_work(&mut self, annos: &mut Vec<Anno>, sel: &mut Option<Sel>) {
+        let kind = match self.tool {
+            Tool::Polygon => "polygon",
+            Tool::Path => "path",
+            Tool::Select => return,
+        };
+        // Drop a duplicated last point (double-click to finish adds one).
+        while self.work.len() >= 2 {
+            let (a, b) = (self.work[self.work.len() - 2], self.work[self.work.len() - 1]);
+            if (a.0 - b.0).abs() < 1e-7 && (a.1 - b.1).abs() < 1e-7 {
+                self.work.pop();
+            } else {
+                break;
+            }
+        }
+        let ok = if kind == "polygon" { self.work.len() >= 3 } else { self.work.len() >= 2 };
+        if ok {
+            let n = annos.iter().filter(|a| a.kind == kind).count() + 1;
+            let id = Anno::next_id(annos);
+            annos.push(Anno {
+                id,
+                name: if kind == "polygon" { format!("Polygon {n}") } else { format!("Path {n}") },
+                kind: kind.into(),
+                pts: self.work.clone(),
+                color: [0x3f, 0xd6, 0xb8],
+                opacity: 1.0,
+                width: 2.0,
+                filled: true,
+                visible: true,
+                locked: false,
+            });
+            *sel = Some(Sel::Anno(annos.len() - 1));
+            annotations::save(annos);
+        }
+        self.work.clear();
+        self.tool = Tool::Select;
+    }
+
+    fn canvas_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>, data_version: &Arc<AtomicU64>, port: u16, annos: &mut Vec<Anno>, sel: &mut Option<Sel>) {
         ui.add_space(8.0);
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
 
         // --- interaction ---------------------------------------------------
-        let z_int = self.zoom.round().clamp(4.0, 19.0) as u8;
+        let z_int = self.z();
         let scale = world_px(z_int) as f64;
-        if resp.dragged() {
-            let d = resp.drag_delta();
-            let (mut mx, mut my) = lonlat_to_merc(self.center.0, self.center.1);
-            mx -= d.x as f64 / scale;
-            my += d.y as f64 / scale;
-            self.center = merc_to_lonlat(mx.clamp(0.0, 1.0), my.clamp(0.0, 1.0));
+        let annos_group_on = app.layers.read().unwrap().is_visible("annotations");
+
+        if self.tool == Tool::Select {
+            if resp.drag_started() {
+                // Grab a drawing under the pointer, else pan.
+                self.move_drag = resp
+                    .interact_pointer_pos()
+                    .and_then(|p| annos.iter().enumerate().rev().find(|(_, a)| annos_group_on && a.visible && !a.locked && self.anno_hit(rect, a, p)).map(|(i, _)| i));
+            }
+            if resp.dragged() {
+                let d = resp.drag_delta();
+                match self.move_drag {
+                    Some(i) => {
+                        if let Some(a) = annos.get_mut(i) {
+                            for pt in &mut a.pts {
+                                let (mx, my) = lonlat_to_merc(pt.0, pt.1);
+                                *pt = merc_to_lonlat((mx + d.x as f64 / scale).clamp(0.0, 1.0), (my + d.y as f64 / scale).clamp(0.0, 1.0));
+                            }
+                        }
+                    }
+                    None => {
+                        let (mut mx, mut my) = lonlat_to_merc(self.center.0, self.center.1);
+                        mx -= d.x as f64 / scale;
+                        my += d.y as f64 / scale;
+                        self.center = merc_to_lonlat(mx.clamp(0.0, 1.0), my.clamp(0.0, 1.0));
+                    }
+                }
+            }
+            if resp.drag_stopped() && self.move_drag.is_some() {
+                self.move_drag = None;
+                annotations::save(annos);
+            }
+            if resp.clicked() {
+                *sel = resp
+                    .interact_pointer_pos()
+                    .and_then(|p| annos.iter().enumerate().rev().find(|(_, a)| annos_group_on && a.visible && self.anno_hit(rect, a, p)).map(|(i, _)| Sel::Anno(i)));
+            }
+            if resp.double_clicked() {
+                self.zoom = (self.zoom + 1.0).clamp(4.0, 19.0);
+            }
+        } else {
+            // Pen tools: left-click adds points, right-drag pans.
+            if ui.input(|i| i.pointer.secondary_down()) && resp.hovered() {
+                let d = ui.input(|i| i.pointer.delta());
+                let (mut mx, mut my) = lonlat_to_merc(self.center.0, self.center.1);
+                mx -= d.x as f64 / scale;
+                my += d.y as f64 / scale;
+                self.center = merc_to_lonlat(mx.clamp(0.0, 1.0), my.clamp(0.0, 1.0));
+            }
+            if resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    if let Some(first) = self.work.first() {
+                        let fp = self.project(rect, first.0, first.1);
+                        if p.distance(fp) <= 10.0 && self.work.len() >= 3 {
+                            self.finish_work(annos, sel);
+                            return;
+                        }
+                    }
+                    let ll = self.unproject(rect, p);
+                    self.work.push(ll);
+                }
+            }
+            if resp.double_clicked() {
+                self.finish_work(annos, sel);
+            }
+            let (enter, back, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Backspace), i.key_pressed(egui::Key::Escape)));
+            if enter {
+                self.finish_work(annos, sel);
+            }
+            if back {
+                self.work.pop();
+            }
+            if esc {
+                self.work.clear();
+                self.tool = Tool::Select;
+            }
         }
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if resp.hovered() && scroll.abs() > 0.5 {
             self.zoom = (self.zoom + scroll * 0.01).clamp(4.0, 19.0);
-        }
-        if resp.double_clicked() {
-            self.zoom = (self.zoom + 1.0).clamp(4.0, 19.0);
         }
 
         // --- paint ----------------------------------------------------------
@@ -1680,8 +1936,92 @@ impl MapState {
             }
         }
 
-        // --- overlays --------------------------------------------------------
+        // --- annotations (above tiles, below the badges) ---------------------
         let t = theme::Tokens::DARK;
+        let mut vertex_updates: Vec<(usize, usize, f64, f64)> = vec![];
+        let mut vertex_save = false;
+        for (ai, a) in annos.iter().enumerate() {
+            if !annos_group_on || !a.visible || a.pts.is_empty() {
+                continue;
+            }
+            let pts: Vec<Pos2> = a.pts.iter().map(|&(lon, lat)| self.project(rect, lon, lat)).collect();
+            let col = Color32::from_rgb(a.color[0], a.color[1], a.color[2]);
+            let is_sel = matches!(sel, Some(Sel::Anno(i)) if *i == ai);
+            // Fill (ear-clipped: user polygons may be concave).
+            if a.kind == "polygon" && a.filled && pts.len() >= 3 {
+                let alpha = (a.opacity.clamp(0.0, 1.0) * 0.42 * 255.0) as u8;
+                let fill = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha);
+                for (i, j, k) in triangulate(&pts) {
+                    painter.add(egui::Shape::convex_polygon(vec![pts[i], pts[j], pts[k]], fill, Stroke::NONE));
+                }
+            }
+            // Stroke (closed ring for polygons).
+            if pts.len() >= 2 {
+                let mut segs = pts.clone();
+                if a.kind == "polygon" {
+                    segs.push(pts[0]);
+                }
+                painter.add(egui::Shape::line(segs, Stroke::new(a.width.max(1.0), col)));
+            }
+            // Selected: vectorcraft-style anchor squares, draggable to edit
+            // the vertices.
+            if is_sel {
+                for (vi, pt) in pts.iter().enumerate() {
+                    let sq = Rect::from_center_size(*pt, Vec2::splat(7.0));
+                    painter.rect_filled(sq, CornerRadius::ZERO, Color32::WHITE);
+                    painter.rect_stroke(sq, CornerRadius::ZERO, Stroke::new(1.2, t.sunken), egui::StrokeKind::Inside);
+                    if !a.locked {
+                        let hresp = ui.interact(Rect::from_center_size(*pt, Vec2::splat(16.0)), egui::Id::new(("anno-h", a.id, vi)), Sense::drag());
+                        if hresp.dragged() {
+                            if let Some(p) = hresp.interact_pointer_pos() {
+                                let (lon, lat) = self.unproject(rect, p);
+                                vertex_updates.push((ai, vi, lon, lat));
+                            }
+                        }
+                        if hresp.drag_stopped() {
+                            vertex_save = true;
+                        }
+                    }
+                }
+            }
+        }
+        for (ai, vi, lon, lat) in vertex_updates {
+            if let Some(pt) = annos.get_mut(ai).and_then(|a| a.pts.get_mut(vi)) {
+                *pt = (lon, lat);
+            }
+        }
+        if vertex_save {
+            annotations::save(annos);
+        }
+
+        // Work-in-progress pen overlay.
+        if self.tool != Tool::Select {
+            let wpts: Vec<Pos2> = self.work.iter().map(|&(lon, lat)| self.project(rect, lon, lat)).collect();
+            let col = t.good;
+            if wpts.len() >= 2 {
+                painter.add(egui::Shape::line(wpts.clone(), Stroke::new(2.0, col)));
+            }
+            if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|_| resp.hovered()) {
+                if let Some(last) = wpts.last() {
+                    painter.add(egui::Shape::dashed_line(&[*last, p], Stroke::new(1.5, col.gamma_multiply(0.85)), 4.0, 3.0));
+                }
+                if let (Some(first), true) = (wpts.first(), wpts.len() >= 3) {
+                    if p.distance(*first) <= 10.0 {
+                        painter.circle_stroke(*first, 7.0, Stroke::new(2.0, col));
+                    }
+                }
+            }
+            for pt in &wpts {
+                let sq = Rect::from_center_size(*pt, Vec2::splat(6.0));
+                painter.rect_filled(sq, CornerRadius::ZERO, Color32::WHITE);
+                painter.rect_stroke(sq, CornerRadius::ZERO, Stroke::new(1.0, t.sunken), egui::StrokeKind::Inside);
+            }
+            if let Some(first) = wpts.first() {
+                painter.rect_stroke(Rect::from_center_size(*first, Vec2::splat(10.0)), CornerRadius::ZERO, Stroke::new(1.3, col), egui::StrokeKind::Middle);
+            }
+        }
+
+        // --- overlays --------------------------------------------------------
         let badge = |painter: &egui::Painter, pos: Pos2, text: String, col: Color32| {
             let size = painter.layout_no_wrap(text.clone(), FontId::new(10.0, theme::mono()), col).size();
             let r = Rect::from_min_size(pos + Vec2::new(8.0, 8.0), Vec2::new(size.x + 16.0, 22.0));
@@ -1720,10 +2060,94 @@ impl MapState {
             }
         });
 
+        self.last_rect = Some(rect);
         if budget < 3 {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
     }
+}
+
+/* ---------------- geometry helpers (screen space) ---------------- */
+
+/// Ray-cast point-in-polygon.
+fn point_in_poly(pts: &[Pos2], p: Pos2) -> bool {
+    let mut inside = false;
+    let n = pts.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[j]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y + f32::EPSILON) + a.x {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Distance from `p` to segment `a–b`.
+fn dist_pt_seg(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let ap = p - a;
+    let t = (ap.dot(ab) / (ab.length_sq() + 1e-6)).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+fn cross3(a: Pos2, b: Pos2, p: Pos2) -> f32 {
+    (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
+}
+
+fn point_in_tri(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+    let (s1, s2, s3) = (cross3(a, b, p), cross3(b, c, p), cross3(c, a, p));
+    (s1 >= 0.0 && s2 >= 0.0 && s3 >= 0.0) || (s1 <= 0.0 && s2 <= 0.0 && s3 <= 0.0)
+}
+
+/// Ear-clip triangulation of a simple polygon (screen space) — user polygons
+/// may be concave, so a triangle fan won't do.
+fn triangulate(pts: &[Pos2]) -> Vec<(usize, usize, usize)> {
+    let n = pts.len();
+    if n < 3 {
+        return vec![];
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    let area2: f32 = (0..n).map(|i| {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        a.x * b.y - b.x * a.y
+    }).sum();
+    if area2 < 0.0 {
+        idx.reverse();
+    }
+    let mut tris = vec![];
+    let mut guard = 0usize;
+    while idx.len() > 3 && guard < 10_000 {
+        guard += 1;
+        let mut clipped = false;
+        'ear: for i in 0..idx.len() {
+            let m = idx.len();
+            let (a, b, c) = (idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]);
+            let (pa, pb, pc) = (pts[a], pts[b], pts[c]);
+            if cross3(pa, pb, pc) <= 0.0 {
+                continue; // reflex or degenerate
+            }
+            if idx.iter().any(|&p| {
+                let p = pts[p];
+                p != pa && p != pb && p != pc && point_in_tri(p, pa, pb, pc)
+            }) {
+                continue;
+            }
+            tris.push((a, b, c));
+            idx.remove(i);
+            clipped = true;
+            break 'ear;
+        }
+        if !clipped {
+            break;
+        }
+    }
+    if idx.len() == 3 {
+        tris.push((idx[0], idx[1], idx[2]));
+    }
+    tris
 }
 
 /// egui wants straight alpha; tiny_skia stores premultiplied.
@@ -1743,43 +2167,110 @@ fn unpremultiply(rgba: &mut [u8]) {
 /* Layers panel (vectorcraft layer-engine style)                           */
 /* --------------------------------------------------------------------- */
 
-/// Panel geometry, straight from the reference: eye column, colour bar,
-/// disclosure chevron, name, then the zoom badge on the right.
+/// Panel geometry, straight from the reference: eye column, lock column,
+/// colour bar, disclosure chevron, name, then the badges on the right.
 const COLUMN: f32 = 25.0;
 const INDENT: f32 = 14.0;
 const ROW_H: f32 = 26.0;
 
-#[derive(Default)]
 struct PanelState {
     search: String,
+    /// Open group ids (engine groups + the synthetic `annotations` group).
     open: std::collections::HashSet<String>,
-    selected: Option<String>,
-    /// Property editors for the selected layer.
+    selected: Option<Sel>,
+    /// Property editors for the selected engine layer.
     edit_zoom: [i32; 2],
+    /// Inline rename in progress: (anno id, buffer).
+    rename: Option<(u64, String)>,
+}
+
+impl Default for PanelState {
+    fn default() -> Self {
+        // The two most useful branches start expanded so the tree reads at a
+        // glance; everything else is a click away.
+        Self {
+            search: String::new(),
+            open: ["transport".to_string(), "water".to_string(), "annotations".to_string()].into_iter().collect(),
+            selected: None,
+            edit_zoom: [0, 0],
+            rename: None,
+        }
+    }
+}
+
+/// One flattened row of the panel tree.
+struct Row {
+    key: String,
+    depth: usize,
+    opens: bool,
+    open: bool,
+    colour: Color32,
+    /// Drawn dimmed: hidden itself or inside a hidden group.
+    dim: bool,
+    src: Src,
+}
+
+/// Where a tree row's state comes from.
+#[derive(Clone, Copy)]
+enum Src {
+    Engine(LayerDef),
+    /// The synthetic `Annotations` group.
+    AnnoGroup,
+    Anno(usize),
+}
+
+/// Whether `d`'s subtree matches the search (the row stays for a match of its
+/// own or of anything inside it).
+fn subtree_matches(defs: &[LayerDef], d: &LayerDef, query: &str) -> bool {
+    d.name.to_lowercase().contains(query) || d.id.contains(query) || children_of(defs, d.id).iter().any(|c| subtree_matches(defs, c, query))
+}
+
+/// A group's bar colour: its own paint, else its first painted child's.
+fn group_colour(defs: &[LayerDef], d: &LayerDef, vis: &LayerVis, app: &Arc<App>) -> Color32 {
+    let paint = |dd: &LayerDef| layer_color(app, vis, dd);
+    if d.color_var.is_some() || d.id == "background" {
+        return paint(d);
+    }
+    children_of(defs, d.id).iter().find(|c| c.color_var.is_some()).map(paint).unwrap_or_else(|| Color32::from_rgb(d.fallback[0], d.fallback[1], d.fallback[2]))
 }
 
 impl PanelState {
-    fn panel_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>, data_version: &Arc<AtomicU64>) {
+    fn panel_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>, data_version: &Arc<AtomicU64>, annos: &mut Vec<Anno>, map: &mut MapState, workspace: &Path) {
         let t = theme::Tokens::DARK;
-        ui.add_space(12.0);
-        ui.add_space(2.0);
+        let defs = layer_catalog();
+        let vis_snapshot = app.layers.read().unwrap().clone();
+        let query = self.search.trim().to_lowercase();
+        let narrowing = !query.is_empty();
+
+        ui.add_space(14.0);
         ui.horizontal(|ui| {
             widgets::hud(ui, "layers", t.faint);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if widgets::button(ui, "Hide all", widgets::Kind::Secondary, 0.0).clicked() {
                     let mut vis = app.layers.write().unwrap();
-                    for d in layer_catalog() {
+                    for d in &defs {
                         vis.visible.insert(d.id.to_string(), false);
                     }
+                    vis.visible.insert("annotations".to_string(), false);
+                    for a in annos.iter_mut() {
+                        a.visible = false;
+                    }
                     vis.touch();
+                    drop(vis);
                     app.invalidate();
+                    annotations::save(annos);
                     data_version.fetch_add(1, Ordering::Relaxed);
                 }
                 if widgets::button(ui, "Show all", widgets::Kind::Secondary, 0.0).clicked() {
                     let mut vis = app.layers.write().unwrap();
                     vis.visible.clear();
+                    for a in annos.iter_mut() {
+                        a.visible = true;
+                    }
                     vis.touch();
+                    drop(vis);
                     app.invalidate();
+                    annotations::save(annos);
                     data_version.fetch_add(1, Ordering::Relaxed);
                 }
             });
@@ -1795,156 +2286,377 @@ impl PanelState {
         );
         ui.add_space(4.0);
 
-        let defs = layer_catalog();
-        let vis_snapshot = app.layers.read().unwrap().clone();
-        let query = self.search.trim().to_lowercase();
-
-        // Row list (groups first, children indented).
-        let mut rows: Vec<(&LayerDef, usize)> = Vec::new();
-        for d in &defs {
-            if d.parent.is_empty() {
-                if !query.is_empty() {
-                    // Match groups with any child hit too.
-                    let children_hit = defs.iter().any(|c| c.parent == d.id && (c.id.contains(&query) || c.name.to_lowercase().contains(&query)));
-                    if !(d.id.contains(&query) || d.name.to_lowercase().contains(&query) || children_hit) {
+        // Flatten the tree: engine groups (open ones expand, depth-indented),
+        // then the synthetic Annotations group with the drawings inside it.
+        let mut rows: Vec<Row> = Vec::new();
+        fn push(d: &LayerDef, depth: usize, shown_parent: bool, defs: &[LayerDef], vis: &LayerVis, app: &Arc<App>, open: &std::collections::HashSet<String>, query: &str, rows: &mut Vec<Row>) {
+            if !query.is_empty() && !subtree_matches(defs, d, query) {
+                return;
+            }
+            let shown = shown_parent && vis.is_visible(d.id);
+            let kids = children_of(defs, d.id);
+            let opens = !kids.is_empty();
+            let is_open = opens && (open.contains(d.id) || !query.is_empty());
+            let colour = group_colour(defs, d, vis, app);
+            rows.push(Row { key: d.id.to_string(), depth, opens, open: is_open, colour, dim: !shown, src: Src::Engine(*d) });
+            if is_open {
+                for c in &kids {
+                    push(c, depth + 1, shown, defs, vis, app, open, query, rows);
+                }
+            }
+        }
+        for d in defs.iter().filter(|d| d.parent.is_empty()) {
+            push(d, 0, true, &defs, &vis_snapshot, app, &self.open, &query, &mut rows);
+        }
+        // The Annotations group (drawings live in it, vectorcraft-style).
+        let annos_hit = narrowing && annos.iter().any(|a| a.name.to_lowercase().contains(&query));
+        if !narrowing || annos_hit {
+            let group_on = vis_snapshot.is_visible("annotations");
+            let group_open = self.open.contains("annotations") || narrowing;
+            rows.push(Row { key: "annotations".into(), depth: 0, opens: !annos.is_empty(), open: group_open, colour: t.good, dim: !group_on, src: Src::AnnoGroup });
+            if group_open {
+                for (i, a) in annos.iter().enumerate() {
+                    if narrowing && !a.name.to_lowercase().contains(&query) {
                         continue;
                     }
-                }
-                rows.push((d, 0));
-                if self.open.contains(d.id) || !query.is_empty() {
-                    for c in &defs {
-                        if c.parent == d.id {
-                            if !query.is_empty() && !(c.id.contains(&query) || c.name.to_lowercase().contains(&query)) {
-                                continue;
-                            }
-                            rows.push((c, 1));
-                        }
-                    }
+                    let colour = Color32::from_rgb(a.color[0], a.color[1], a.color[2]);
+                    rows.push(Row { key: format!("anno-{}", a.id), depth: 1, opens: false, open: false, colour, dim: !group_on || !a.visible, src: Src::Anno(i) });
                 }
             }
         }
 
         // The properties editor takes the bottom half; the tree scrolls on top.
-        let total_h = ui.available_height() - 6.0;
+        let total_h = ui.available_height() - 36.0; // bottom bar
         let list_h = if self.selected.is_some() { (total_h * 0.52).max(160.0) } else { total_h };
 
         egui::ScrollArea::vertical().id_salt("layer-rows").max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for (d, depth) in rows.iter() {
-                self.row_ui(ui, d, *depth, &vis_snapshot, app, data_version);
+            for row in &rows {
+                self.row_ui(ui, row, &vis_snapshot, app, data_version, annos);
             }
         });
 
-        // Engine layer properties for the selected layer.
-        if let Some(sel) = self.selected.clone() {
-            ui.add_space(6.0);
-            if let Some(def) = defs.iter().find(|d| d.id == sel) {
-                self.properties_ui(ui, def, app, data_version, &vis_snapshot);
+        // Bottom bar: counts + the drawing tools (vectorcraft's footer).
+        self.bottom_bar(ui, app, data_version, annos, map);
+
+        // Properties for the selected row.
+        match self.selected.clone() {
+            Some(Sel::Layer(id)) => {
+                if let Some(def) = defs.iter().find(|d| d.id == id) {
+                    ui.add_space(6.0);
+                    self.properties_ui(ui, def, app, data_version, &vis_snapshot);
+                }
             }
+            Some(Sel::Anno(i)) => {
+                ui.add_space(6.0);
+                self.anno_properties_ui(ui, app, data_version, annos, map, workspace, i);
+            }
+            None => {}
         }
     }
 
-    fn row_ui(&mut self, ui: &mut egui::Ui, d: &LayerDef, depth: usize, vis: &LayerVis, app: &Arc<App>, data_version: &Arc<AtomicU64>) {
+    fn bottom_bar(&mut self, ui: &mut egui::Ui, app: &Arc<App>, data_version: &Arc<AtomicU64>, annos: &mut Vec<Anno>, map: &mut MapState) {
+        let t = theme::Tokens::DARK;
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+        ui.painter().hline(bar.left()..=bar.right(), bar.top(), theme::hairline());
+        let layers_n = layer_catalog().len();
+        ui.painter().text(
+            bar.left_center() + Vec2::new(4.0, 0.0),
+            Align2::LEFT_CENTER,
+            format!("{layers_n} layers · {} {}", annos.len(), if annos.len() == 1 { "drawing" } else { "drawings" }),
+            FontId::new(10.0, theme::mono()),
+            t.faint,
+        );
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(Layout::right_to_left(Align::Center)));
+        child.add_space(6.0);
+        // Delete the selected drawing.
+        let sel_anno = matches!(self.selected, Some(Sel::Anno(_))).then(|| match self.selected {
+            Some(Sel::Anno(i)) if annos.get(i).is_some_and(|a| !a.locked) => Some(i),
+            _ => None,
+        }).flatten();
+        if mini_icon(&mut child, "trash", paint_trash).clicked() {
+            if let Some(i) = sel_anno {
+                annos.remove(i);
+                self.selected = None;
+                annotations::save(annos);
+                app.invalidate();
+                data_version.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Frame the selection.
+        if mini_icon(&mut child, "fit", paint_fit).clicked() {
+            match self.selected {
+                Some(Sel::Anno(i)) => {
+                    if let (Some(r), Some(a)) = (map.last_rect, annos.get(i)) {
+                        map.fit_annotation(r, a);
+                    }
+                }
+                _ => {
+                    if let Some(r) = map.last_rect {
+                        let b = app.store.read().unwrap().bbox;
+                        map.fit_bbox(r, b);
+                    }
+                }
+            }
+        }
+        // New path / new polygon: switch to the pen tools.
+        if mini_icon(&mut child, "path", paint_path_icon).clicked() {
+            map.tool = Tool::Path;
+            map.work.clear();
+        }
+        if mini_icon(&mut child, "poly", paint_poly_icon).clicked() {
+            map.tool = Tool::Polygon;
+            map.work.clear();
+        }
+    }
+
+    fn row_ui(&mut self, ui: &mut egui::Ui, row: &Row, vis: &LayerVis, app: &Arc<App>, data_version: &Arc<AtomicU64>, annos: &mut Vec<Anno>) {
         let t = theme::Tokens::DARK;
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
-        let selected = self.selected.as_deref() == Some(d.id);
-        if selected {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, t.sunken);
-            ui.painter().rect_filled(Rect::from_min_size(rect.min, Vec2::new(2.0, ROW_H)), CornerRadius::ZERO, t.accent_ink);
+        let p = ui.painter().clone();
+
+        let sel = match (&self.selected, &row.src) {
+            (Some(Sel::Layer(s)), Src::Engine(d)) => s == d.id,
+            (Some(Sel::Anno(i)), Src::Anno(j)) => i == j,
+            _ => false,
+        };
+        if sel {
+            p.rect_filled(rect, CornerRadius::ZERO, t.sunken);
+            p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(2.0, ROW_H)), CornerRadius::ZERO, t.accent_ink);
         } else if resp.hovered() {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, t.sunken.gamma_multiply(0.6));
+            p.rect_filled(rect, CornerRadius::ZERO, t.sunken.gamma_multiply(0.6));
         }
-        ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, t.line));
+        p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, t.line));
 
-        let p = ui.painter();
-        let visible = vis.is_visible(d.id);
-        let dim = if visible { t.ink } else { t.muted };
+        // Per-row state.
+        let (visible, locked) = match row.src {
+            Src::Engine(d) => (vis.is_visible(d.id), vis.is_locked(d.id)),
+            Src::Anno(i) => annos.get(i).map_or((false, true), |a| (a.visible, a.locked)),
+            Src::AnnoGroup => (vis.is_visible("annotations"), !annos.is_empty() && annos.iter().all(|a| a.locked)),
+        };
 
-        // Eye column (painted, not a glyph — survives any font set).
-        let eye_c = Pos2::new(rect.left() + COLUMN / 2.0, rect.center().y);
+        // Eye column.
+        let eye = Rect::from_min_size(rect.min, Vec2::new(COLUMN, ROW_H));
+        let lock_r = Rect::from_min_size(rect.min + Vec2::new(COLUMN, 0.0), Vec2::new(COLUMN, ROW_H));
+        p.line_segment([eye.right_top(), eye.right_bottom()], Stroke::new(1.0, t.line));
+        p.line_segment([lock_r.right_top(), lock_r.right_bottom()], Stroke::new(1.0, t.line));
         let eye_col = if visible { t.good } else { t.muted };
-        p.circle_stroke(eye_c, 5.0, Stroke::new(1.4, eye_col));
+        let ec = eye.center();
+        p.circle_stroke(ec, 5.0, Stroke::new(1.4, eye_col));
         if visible {
-            p.circle_filled(eye_c, 2.4, eye_col);
+            p.circle_filled(ec, 2.4, eye_col);
         }
+        let eresp = ui.interact(eye, ui.id().with(("eye", &row.key)), Sense::click());
 
-        // Colour bar (group = wide, child = thin) — vectorcraft's marker.
-        let mut x = rect.left() + COLUMN + 2.0;
-        let bar_w = if d.kind == "group" { 4.0 } else { 2.0 };
-        let col = layer_color(app, vis, d);
-        p.rect_filled(Rect::from_min_size(Pos2::new(x - 1.0, rect.top() + 3.0), Vec2::new(bar_w, ROW_H - 6.0)), CornerRadius::ZERO, col);
-        x += 8.0 + depth as f32 * INDENT;
+        // Lock column (painted padlock; ghost on hover).
+        let lc = lock_r.center();
+        if locked {
+            paint_padlock(&p, lc, t.warn);
+        } else {
+            let lr_hover = ui.interact(lock_r, ui.id().with(("lock", &row.key)), Sense::click()).hovered();
+            if lr_hover {
+                paint_padlock(&p, lc, t.faint);
+            }
+        }
+        let lresp = ui.interact(lock_r, ui.id().with(("lock", &row.key)), Sense::click());
 
-        // Disclosure chevron for groups.
-        let is_group = d.kind == "group";
-        if is_group {
-            let open = self.open.contains(d.id) || !self.search.trim().is_empty();
+        // Colour bar (groups wide, leaves thin) — vectorcraft's marker.
+        let mut x = rect.left() + 2.0 * COLUMN + 2.0;
+        let bar_w = if row.opens { 4.0 } else { 2.0 };
+        p.rect_filled(Rect::from_min_size(Pos2::new(x - 1.0, rect.top() + 3.0), Vec2::new(bar_w, ROW_H - 6.0)), CornerRadius::ZERO, row.colour);
+        x += 8.0 + row.depth as f32 * INDENT;
+
+        // Disclosure chevron.
+        if row.opens {
             let dr = Rect::from_min_size(Pos2::new(x, rect.center().y - 8.0), Vec2::new(14.0, 16.0));
             let c = dr.center();
-            let tri: Vec<Pos2> = if open {
+            let tri: Vec<Pos2> = if row.open {
                 vec![Pos2::new(c.x - 4.0, c.y - 2.0), Pos2::new(c.x + 4.0, c.y - 2.0), Pos2::new(c.x, c.y + 3.0)]
             } else {
                 vec![Pos2::new(c.x - 2.0, c.y - 4.0), Pos2::new(c.x - 2.0, c.y + 4.0), Pos2::new(c.x + 3.0, c.y)]
             };
             p.add(egui::Shape::convex_polygon(tri, t.muted, Stroke::NONE));
-            let dresp = ui.interact(dr, ui.id().with(("disc", d.id)), Sense::click());
+            let dresp = ui.interact(dr, ui.id().with(("disc", &row.key)), Sense::click());
             if dresp.clicked() {
-                if open {
-                    self.open.remove(d.id);
+                if row.open {
+                    self.open.remove(&row.key);
                 } else {
-                    self.open.insert(d.id.to_string());
+                    self.open.insert(row.key.clone());
                 }
             }
         }
         x += 16.0;
 
-        // Name + kind chip.
-        p.text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, d.name, FontId::new(12.5, FontFamily::Proportional), dim);
-        let kind_col = match d.kind {
-            "engine" => t.warn,
-            "label" => t.accent_ink,
-            _ => t.faint,
+        let ink = if row.dim { t.muted } else { t.ink };
+
+        // Name (inline editor while renaming a drawing).
+        let name = match row.src {
+            Src::Engine(d) => d.name.to_string(),
+            Src::Anno(i) => annos.get(i).map(|a| a.name.clone()).unwrap_or_default(),
+            Src::AnnoGroup => "Annotations".to_string(),
         };
-        if d.kind != "group" {
-            let label = d.kind.to_uppercase();
-            let name_w = p.layout_no_wrap(d.name.to_string(), FontId::new(12.5, FontFamily::Proportional), dim).size().x;
-            p.text(Pos2::new(x + name_w + 8.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::new(8.5, theme::mono()), kind_col);
+        let name_rect = Rect::from_min_max(Pos2::new(x - 2.0, rect.center().y - 10.0), Pos2::new(rect.right() - 74.0, rect.center().y + 10.0));
+        let mut renamed = false;
+        if let Src::Anno(i) = row.src {
+            let id = annos.get(i).map(|a| a.id).unwrap_or(0);
+            if self.rename.as_ref().is_some_and(|(rid, _)| *rid == id) {
+                let mut buf = self.rename.take().unwrap().1;
+                let te = ui.new_child(egui::UiBuilder::new().max_rect(name_rect)).add(
+                    egui::TextEdit::singleline(&mut buf).desired_width(name_rect.width()).font(FontId::new(12.0, FontFamily::Proportional)),
+                );
+                if !te.has_focus() && !te.lost_focus() {
+                    te.request_focus();
+                }
+                if te.lost_focus() {
+                    renamed = true;
+                    if !ui.input(|i| i.key_pressed(egui::Key::Escape)) && buf != name {
+                        if let Some(a) = annos.get_mut(i) {
+                            a.name = buf.clone();
+                        }
+                    }
+                } else {
+                    self.rename = Some((id, buf));
+                }
+            }
+        }
+        if !renamed {
+            let galley = p.layout(name.clone(), FontId::new(12.5, FontFamily::Proportional), ink, name_rect.width());
+            let clip = p.with_clip_rect(name_rect);
+            clip.galley(Pos2::new(x - 2.0, rect.center().y - galley.size().y / 2.0), galley.clone(), ink);
         }
 
-        // Zoom badge on the right.
-        let (zmin, zmax) = vis.zoom.get(d.id).copied().unwrap_or((d.min_zoom, d.max_zoom));
-        let badge = if zmax >= 19 { format!("z{zmin}+") } else { format!("z{zmin}–{zmax}") };
-        p.text(Pos2::new(rect.right() - 6.0, rect.center().y), Align2::RIGHT_CENTER, badge, FontId::new(9.5, theme::mono()), t.faint);
+        // Kind chip + right badge.
+        match row.src {
+            Src::Engine(d) if d.kind != "group" => {
+                let kind_col = match d.kind {
+                    "engine" => t.warn,
+                    "label" => t.accent_ink,
+                    _ => t.faint,
+                };
+                let name_w = p.layout_no_wrap(name.clone(), FontId::new(12.5, FontFamily::Proportional), ink).size().x;
+                p.text(Pos2::new(x + name_w + 8.0, rect.center().y), Align2::LEFT_CENTER, d.kind.to_uppercase(), FontId::new(8.5, theme::mono()), kind_col);
+                let (zmin, zmax) = vis.zoom.get(d.id).copied().unwrap_or((d.min_zoom, d.max_zoom));
+                let badge = if zmax >= 19 { format!("z{zmin}+") } else { format!("z{zmin}–{zmax}") };
+                p.text(Pos2::new(rect.right() - 6.0, rect.center().y), Align2::RIGHT_CENTER, badge, FontId::new(9.5, theme::mono()), t.faint);
+            }
+            Src::Anno(i) => {
+                if let Some(a) = annos.get(i) {
+                    let name_w = p.layout_no_wrap(name.clone(), FontId::new(12.5, FontFamily::Proportional), ink).size().x;
+                    p.text(Pos2::new(x + name_w + 8.0, rect.center().y), Align2::LEFT_CENTER, a.kind.to_uppercase(), FontId::new(8.5, theme::mono()), t.good);
+                    p.text(Pos2::new(rect.right() - 6.0, rect.center().y), Align2::RIGHT_CENTER, format!("{} pts", a.pts.len()), FontId::new(9.5, theme::mono()), t.faint);
+                }
+            }
+            _ => {}
+        }
 
-        // Interactions: click on the eye column toggles, click on the row selects.
-        if resp.clicked() {
-            let on_eye = resp.interact_pointer_pos().is_some_and(|p| p.x - rect.left() < COLUMN);
-            if on_eye {
-                self.toggle(app, d.id, !visible, data_version);
+        // --- interactions --------------------------------------------------
+        let alt = ui.input(|i| i.modifiers.alt);
+        let on_col = |r: &egui::Response| r.interact_pointer_pos().is_some_and(|pp| pp.x < rect.left() + 2.0 * COLUMN);
+
+        if eresp.clicked() {
+            let defs = layer_catalog();
+            if alt {
+                // Isolate: hide every other top-level group (or show all when
+                // everything else is already hidden) — vectorcraft's
+                // Hide/Show Others, for easy drawing on one layer.
+                let top = match row.src {
+                    Src::Engine(d) => top_ancestor_of(&defs, d.id),
+                    _ => "annotations".to_string(),
+                };
+                let mut v = app.layers.write().unwrap();
+                isolate_top(&mut v, annos, &top);
+                drop(v);
+                app.invalidate();
+                annotations::save(annos);
+                data_version.fetch_add(1, Ordering::Relaxed);
             } else {
-                self.selected = Some(d.id.to_string());
-                let (mn, mx) = vis.zoom.get(d.id).copied().unwrap_or((d.min_zoom, d.max_zoom));
-                self.edit_zoom = [mn as i32, mx as i32];
+                match row.src {
+                    Src::Engine(d) => {
+                        let nv = !visible;
+                        let mut v = app.layers.write().unwrap();
+                        v.visible.insert(d.id.to_string(), nv);
+                        for id in descendants_of(&defs, d.id) {
+                            v.visible.insert(id.to_string(), nv);
+                        }
+                        v.touch();
+                        drop(v);
+                        app.invalidate();
+                        data_version.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Src::AnnoGroup => {
+                        let nv = !visible;
+                        app.layers.write().unwrap().visible.insert("annotations".to_string(), nv);
+                        app.invalidate();
+                        data_version.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Src::Anno(i) => {
+                        if let Some(a) = annos.get_mut(i) {
+                            a.visible = !a.visible;
+                        }
+                        annotations::save(annos);
+                    }
+                }
+            }
+        }
+        if lresp.clicked() {
+            let defs = layer_catalog();
+            match row.src {
+                Src::Engine(d) => {
+                    let nv = !locked;
+                    let mut v = app.layers.write().unwrap();
+                    v.locked.insert(d.id.to_string(), nv);
+                    for id in descendants_of(&defs, d.id) {
+                        v.locked.insert(id.to_string(), nv);
+                    }
+                    v.touch();
+                }
+                Src::AnnoGroup => {
+                    let nv = !locked;
+                    for a in annos.iter_mut() {
+                        a.locked = nv;
+                    }
+                    annotations::save(annos);
+                }
+                Src::Anno(i) => {
+                    if let Some(a) = annos.get_mut(i) {
+                        a.locked = !a.locked;
+                    }
+                    annotations::save(annos);
+                }
+            }
+        }
+
+        if resp.clicked() && !on_col(&resp) && !eresp.hovered() && !lresp.hovered() {
+            match row.src {
+                Src::Engine(d) => {
+                    self.selected = Some(Sel::Layer(d.id.to_string()));
+                    let (mn, mx) = vis.zoom.get(d.id).copied().unwrap_or((d.min_zoom, d.max_zoom));
+                    self.edit_zoom = [mn as i32, mx as i32];
+                }
+                Src::Anno(i) => self.selected = Some(Sel::Anno(i)),
+                Src::AnnoGroup => self.selected = Some(Sel::Layer("annotations".into())),
+            }
+        }
+        // Double-click a drawing row to rename it inline.
+        if resp.double_clicked() && !on_col(&resp) {
+            if let Src::Anno(i) = row.src {
+                if let Some(a) = annos.get(i) {
+                    self.rename = Some((a.id, a.name.clone()));
+                }
             }
         }
     }
 
-    fn toggle(&mut self, app: &Arc<App>, id: &str, value: bool, data_version: &Arc<AtomicU64>) {
-        {
-            let mut vis = app.layers.write().unwrap();
-            vis.visible.insert(id.to_string(), value);
-            vis.touch();
-        }
-        app.invalidate();
-        data_version.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn properties_ui(&mut self, ui: &mut egui::Ui, def: &LayerDef, app: &Arc<App>, data_version: &Arc<AtomicU64>, vis: &LayerVis) {
         let t = theme::Tokens::DARK;
+        let locked = vis.is_locked(def.id);
         ui.horizontal(|ui| {
             widgets::hud(ui, "engine layer properties", t.faint);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if widgets::button(ui, "Reset", widgets::Kind::Secondary, 0.0).clicked() {
+                if locked {
+                    widgets::badge(ui, "locked", t.warn);
+                }
+                if widgets::button(ui, "Reset", widgets::Kind::Secondary, 0.0).clicked() && !locked {
                     let mut v = app.layers.write().unwrap();
                     v.visible.remove(def.id);
                     v.opacity.remove(def.id);
@@ -1963,6 +2675,12 @@ impl PanelState {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(def.vector_path).size(11.0).monospace().color(t.ink));
             });
+
+            if locked {
+                ui.add_space(6.0);
+                widgets::hud(ui, "locked — unlock the row in the tree to edit", t.warn);
+                return;
+            }
 
             // Paint: fill colour + swatch.
             ui.add_space(4.0);
@@ -2039,6 +2757,242 @@ impl PanelState {
             }
         });
     }
+
+    fn anno_properties_ui(&mut self, ui: &mut egui::Ui, app: &Arc<App>, data_version: &Arc<AtomicU64>, annos: &mut Vec<Anno>, map: &mut MapState, workspace: &Path, i: usize) {
+        let t = theme::Tokens::DARK;
+        let Some(a) = annos.get(i) else { return };
+        let (id, name, kind, color, opacity, width, filled, locked) =
+            (a.id, a.name.clone(), a.kind.clone(), a.color, a.opacity, a.width, a.filled, a.locked);
+        let (n_pts, len_m, area_m2) = (a.pts.len(), a.length_m(), a.area_m2());
+        let bbox = {
+            let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+            for &(lon, lat) in &annos[i].pts {
+                b = [b[0].min(lon), b[1].min(lat), b[2].max(lon), b[3].max(lat)];
+            }
+            b
+        };
+        ui.horizontal(|ui| {
+            widgets::hud(ui, "drawing properties", t.faint);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if locked {
+                    widgets::badge(ui, "locked", t.warn);
+                }
+                if widgets::button(ui, "Delete", widgets::Kind::Secondary, 0.0).clicked() && !locked {
+                    annos.remove(i);
+                    self.selected = None;
+                    annotations::save(annos);
+                    app.invalidate();
+                    data_version.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        });
+        egui::ScrollArea::vertical().id_salt("anno-props").auto_shrink([false, false]).show(ui, |ui| {
+            // Name.
+            widgets::hud(ui, "name", t.faint);
+            let mut buf = name.clone();
+            if ui.add(egui::TextEdit::singleline(&mut buf).desired_width(f32::INFINITY).font(FontId::new(12.5, FontFamily::Proportional))).lost_focus()
+                && buf != name
+                && !buf.trim().is_empty()
+            {
+                if let Some(a) = annos.iter_mut().find(|a| a.id == id) {
+                    a.name = buf.trim().to_string();
+                }
+                annotations::save(annos);
+            }
+
+            // Paint.
+            ui.add_space(4.0);
+            widgets::hud(ui, "paint", t.faint);
+            ui.horizontal(|ui| {
+                let (sw, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+                let col = Color32::from_rgb(color[0], color[1], color[2]);
+                ui.painter().rect_filled(sw, CornerRadius::ZERO, col);
+                ui.painter().rect_stroke(sw, CornerRadius::ZERO, theme::hairline(), egui::StrokeKind::Outside);
+                let mut hex = format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
+                let resp = ui.add(egui::TextEdit::singleline(&mut hex).desired_width(86.0).font(FontId::new(12.0, FontFamily::Monospace)));
+                if resp.changed() {
+                    if let Some(c) = parse_hex(&hex) {
+                        if let Some(a) = annos.iter_mut().find(|a| a.id == id) {
+                            a.color = c;
+                        }
+                        annotations::save(annos);
+                    }
+                }
+            });
+
+            // Opacity + stroke width.
+            ui.add_space(4.0);
+            widgets::hud(ui, "opacity", t.faint);
+            let mut op = opacity;
+            if ui.add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(true)).changed() {
+                if let Some(a) = annos.iter_mut().find(|a| a.id == id) {
+                    a.opacity = op;
+                }
+                annotations::save(annos);
+            }
+            ui.add_space(4.0);
+            widgets::hud(ui, "stroke width", t.faint);
+            let mut w = width;
+            if ui.add(egui::Slider::new(&mut w, 1.0..=8.0).show_value(true)).changed() {
+                if let Some(a) = annos.iter_mut().find(|a| a.id == id) {
+                    a.width = w;
+                }
+                annotations::save(annos);
+            }
+            if kind == "polygon" {
+                ui.add_space(4.0);
+                let mut f = filled;
+                if ui.checkbox(&mut f, "Fill the polygon").changed() {
+                    if let Some(a) = annos.iter_mut().find(|a| a.id == id) {
+                        a.filled = f;
+                    }
+                    annotations::save(annos);
+                }
+            }
+
+            // Stats.
+            ui.add_space(4.0);
+            widgets::hud(ui, "geometry", t.faint);
+            egui::Frame::new().fill(t.sunken).stroke(theme::hairline()).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(format!("{n_pts} vertices · ≈{} long", human_m(len_m))).size(11.0).monospace().color(t.ink));
+                if area_m2 > 0.0 {
+                    ui.label(RichText::new(format!("area ≈{}", human_m2(area_m2))).size(11.0).monospace().color(t.ink));
+                }
+            });
+
+            // Actions.
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if widgets::button(ui, "Fit view", widgets::Kind::Secondary, 0.0).clicked() {
+                    if let Some(r) = map.last_rect {
+                        map.fit_bbox(r, bbox);
+                    }
+                }
+                if widgets::button(ui, "Export GeoJSON", widgets::Kind::Secondary, 0.0).clicked() {
+                    match annotations::export_geojson(annos, workspace) {
+                        Some(p) => {
+                            // Toast comes from the shell; a quiet print here.
+                            println!("annotations exported: {}", p.display());
+                        }
+                        None => println!("annotations export failed"),
+                    }
+                }
+            });
+            if locked {
+                ui.add_space(4.0);
+                widgets::hud(ui, "locked — unlock the row in the tree to edit", t.warn);
+            }
+        });
+    }
+}
+
+/// Hide every top-level group except `top` (or show all when everything else
+/// is already hidden) — vectorcraft's Alt-click Hide/Show Others.
+fn isolate_top(vis: &mut LayerVis, annos: &mut [Anno], top: &str) {
+    let defs = layer_catalog();
+    let tops: Vec<String> = defs.iter().filter(|d| d.parent.is_empty()).map(|d| d.id.to_string()).chain(std::iter::once("annotations".to_string())).collect();
+    let others_visible = tops.iter().filter(|t| t.as_str() != top).any(|t| {
+        if t == "annotations" {
+            vis.is_visible("annotations") && annos.iter().any(|a| a.visible)
+        } else {
+            vis.is_visible(t)
+        }
+    });
+    if others_visible {
+        for t in tops.iter().filter(|t| t.as_str() != top) {
+            if t == "annotations" {
+                vis.visible.insert("annotations".to_string(), false);
+                for a in annos.iter_mut() {
+                    a.visible = false;
+                }
+            } else {
+                vis.visible.insert(t.clone(), false);
+                for id in descendants_of(&defs, t) {
+                    vis.visible.insert(id.to_string(), false);
+                }
+            }
+        }
+    } else {
+        vis.visible.clear();
+        for a in annos.iter_mut() {
+            a.visible = true;
+        }
+    }
+    vis.touch();
+}
+
+fn human_m(m: f64) -> String {
+    if m >= 1000.0 {
+        format!("{:.1} km", m / 1000.0)
+    } else {
+        format!("{m:.0} m")
+    }
+}
+
+fn human_m2(m2: f64) -> String {
+    if m2 >= 1_000_000.0 {
+        format!("{:.2} km²", m2 / 1_000_000.0)
+    } else {
+        format!("{m2:.0} m²")
+    }
+}
+
+/// A 24px square icon button with a painter-drawn glyph (panel footer).
+fn mini_icon(ui: &mut egui::Ui, id: &str, paint: fn(&egui::Painter, Rect, Color32)) -> egui::Response {
+    let t = theme::Tokens::DARK;
+    let (r, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    let (fill, stroke_col, ink) = if resp.hovered() { (t.sunken, t.line_strong, t.ink) } else { (t.bg, t.line, t.muted) };
+    ui.painter().rect(r, CornerRadius::ZERO, fill, Stroke::new(1.0, stroke_col), egui::StrokeKind::Inside);
+    paint(ui.painter(), r, ink);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(match id {
+        "poly" => "Draw a new polygon",
+        "path" => "Draw a new path",
+        "fit" => "Frame the selection",
+        _ => "Delete the selected drawing",
+    })
+}
+
+fn paint_poly_icon(p: &egui::Painter, r: Rect, ink: Color32) {
+    let c = r.center();
+    let pts = [Pos2::new(c.x, c.y - 5.5), Pos2::new(c.x + 5.5, c.y + 4.0), Pos2::new(c.x - 5.5, c.y + 4.0)];
+    p.add(egui::Shape::convex_polygon(pts.to_vec(), Color32::TRANSPARENT, Stroke::new(1.4, ink)));
+}
+
+fn paint_path_icon(p: &egui::Painter, r: Rect, ink: Color32) {
+    let c = r.center();
+    p.add(egui::Shape::line(
+        vec![Pos2::new(c.x - 5.5, c.y + 4.5), Pos2::new(c.x - 1.0, c.y - 4.5), Pos2::new(c.x + 2.5, c.y + 1.5), Pos2::new(c.x + 5.5, c.y - 3.5)],
+        Stroke::new(1.4, ink),
+    ));
+}
+
+fn paint_fit(p: &egui::Painter, r: Rect, ink: Color32) {
+    let c = r.center();
+    p.circle_stroke(c, 4.5, Stroke::new(1.3, ink));
+    p.circle_filled(c, 1.2, ink);
+    for d in [Vec2::new(0.0, -8.0), Vec2::new(0.0, 8.0), Vec2::new(-8.0, 0.0), Vec2::new(8.0, 0.0)] {
+        p.line_segment([c + d * 0.55, c + d], Stroke::new(1.3, ink));
+    }
+}
+
+fn paint_trash(p: &egui::Painter, r: Rect, ink: Color32) {
+    let c = r.center();
+    let s = Stroke::new(1.3, ink);
+    p.hline(c.x - 4.5..=c.x + 4.5, c.y - 3.5, s);
+    p.add(egui::Shape::line(
+        vec![Pos2::new(c.x - 2.0, c.y - 3.5), Pos2::new(c.x - 2.0, c.y - 5.5), Pos2::new(c.x + 2.0, c.y - 5.5), Pos2::new(c.x + 2.0, c.y - 3.5)],
+        s,
+    ));
+    p.rect_stroke(Rect::from_min_size(Pos2::new(c.x - 3.5, c.y - 3.5), Vec2::new(7.0, 9.5)), CornerRadius::ZERO, s, egui::StrokeKind::Inside);
+    p.vline(c.x - 1.0, c.y - 1.0..=c.y + 4.0, s);
+    p.vline(c.x + 1.0, c.y - 1.0..=c.y + 4.0, s);
+}
+
+fn paint_padlock(p: &egui::Painter, c: Pos2, ink: Color32) {
+    let s = Stroke::new(1.2, ink);
+    p.rect_stroke(Rect::from_min_size(Pos2::new(c.x - 3.5, c.y - 1.0), Vec2::new(7.0, 6.0)), CornerRadius::ZERO, s, egui::StrokeKind::Inside);
+    p.circle_stroke(c + Vec2::new(0.0, -1.5), 2.6, Stroke::new(1.2, ink));
 }
 
 fn layer_color(app: &Arc<App>, vis: &LayerVis, d: &LayerDef) -> Color32 {

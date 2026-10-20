@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "carto-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "carto-math",
@@ -467,11 +467,11 @@ dependencies = [
 
 [[package]]
 name = "carto-math"
-version = "0.5.1"
+version = "0.6.0"
 
 [[package]]
 name = "carto-style"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "include_dir",
 ]
@@ -3082,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "tile-server"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "carto-core",
  "carto-math",
@@ -3098,14 +3098,14 @@ dependencies = [
 
 [[package]]
 name = "tile-server-cli"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "tile-server-core",
 ]
 
 [[package]]
 name = "tile-server-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "carto-core",
  "carto-math",

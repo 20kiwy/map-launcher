@@ -1,5 +1,5 @@
-[submodule "vendor/openstreetmap-carto"]
-	path = vendor/openstreetmap-carto
+[submodule "clone/openstreetmap-carto"]
+	path = clone/openstreetmap-carto
 	url = https://github.com/openstreetmap-carto/openstreetmap-carto.git
 [submodule "clone/craft-launcher"]
 	path = clone/craft-launcher

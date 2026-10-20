@@ -1,6 +1,6 @@
 {
   "name": "map-launcher",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "Pure-Rust map-launcher: carto style engine + OSM tile server (port 3100)",
   "scripts": {
