@@ -19,5 +19,9 @@ carto-core = { path = "../carto-core" }
 tile-server-core = { path = "../tile-server-core" }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11"] }
 
+[target.'cfg(windows)'.dependencies]
+# Native folder picker for "Change data folder…" (Linux uses the path field).
+rfd = "0.15"
+
 [package.metadata.notes]
-ui = "egui shell: Map tab (tile canvas + vectocraft-style layer engine panel) + Downloads tab (craft-launcher-style region cards)"
+ui = "craft-launcher UI: frameless window + custom titlebar, hard edges, hairlines, mono HUD labels; Map tab (tile canvas + vectocraft-style layer engine panel) + Downloads tab (craft-launcher-style region table + local data table + folder browser)"

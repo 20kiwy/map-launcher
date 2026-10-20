@@ -76,12 +76,23 @@ pub struct App {
     pub misses: AtomicUsize,
     /// Human label of the active region ("Central Tanzania (Dodoma)" etc).
     pub region_name: Mutex<String>,
+    /// Folder the active store was loaded from (shown as the data folder;
+    /// updated whenever a region or a browsed folder is swapped in).
+    pub data_dir: Mutex<PathBuf>,
 }
 
 impl App {
     /// Drop every cached tile (after a layer edit or a region switch).
     pub fn invalidate(&self) {
         self.cache.lock().unwrap().clear();
+    }
+
+    /// Swap in a new store at runtime (Downloads tab: install or browse).
+    pub fn set_store(&self, store: Store, label: String, dir: PathBuf) {
+        *self.store.write().unwrap() = store;
+        *self.region_name.lock().unwrap() = label;
+        *self.data_dir.lock().unwrap() = dir;
+        self.invalidate();
     }
 
     pub fn stats(&self) -> StatsDto {
@@ -1250,7 +1261,21 @@ pub fn app_from_stack(stack: Stack) -> Arc<App> {
         hits: AtomicUsize::new(0),
         misses: AtomicUsize::new(0),
         region_name: Mutex::new(region),
+        data_dir: Mutex::new(stack.data_dir),
     })
+}
+
+/// Extra, platform-specific guidance for a listener bind failure — Windows
+/// reports reserved port ranges (Hyper-V / WSL / Docker NAT) as WSAEACCES
+/// 10013, which looks nothing like "port busy" to most users.
+pub fn bind_error_hint(e: &std::io::Error, port: u16) -> String {
+    match e.raw_os_error() {
+        Some(10013) => format!(
+            "bind 0.0.0.0:{port} failed: {e}\n  Windows: port {port} sits in a reserved range (Hyper-V / WSL / Docker NAT) or a service holds it.\n  1) check: netsh interface ipv4 show excludedportrange protocol=tcp\n  2) free it (admin): net stop winnat  &&  net start winnat\n  3) or pick another port: tile-server --port 3150 (or edit PORT in the header)"
+        ),
+        Some(10048) => format!("bind 0.0.0.0:{port} failed: {e}\n  another tile-server (or app) is already listening on {port} — stop it or use --port"),
+        _ => format!("bind 0.0.0.0:{port} failed: {e}"),
+    }
 }
 
 /* --------------------------------------------------------------------- */
@@ -1324,7 +1349,7 @@ pub fn run_headless(port: u16, data_flag: Option<String>) -> i32 {
             }
         }
         Err(e) => {
-            eprintln!("bind :{port} failed ({e}) — is another tile-server already running?");
+            eprintln!("{}", bind_error_hint(&e, port));
             1
         }
     }
