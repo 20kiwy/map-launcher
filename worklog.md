@@ -187,3 +187,25 @@ Stage Summary:
 - Git history is token-free forever (leaked file purged from every commit; scans clean) and the new token is only in ~/.git-credentials outside the repo
 - v0.5.0 is live: https://github.com/20kiwy/map-launcher/releases/tag/v0.5.0 with the three-product build (tile-server GUI+server / tile-server-cli / map-launcher-web)
 - Screenshot tooling is deterministic now (X11 root grab), screenshots versioned and committed
+
+---
+Task ID: 21
+Agent: Z.ai Code (main)
+Task: v0.5.1 — user's Windows run hit two issues (store not found when the exe runs from WinRAR's temp dir; bind error 10013 on port 3100) and asked for craft-launcher-faithful styling: proper titlebar, a data-folder browser that shows local vs downloadable files in the Downloads tab, and a proper data table.
+
+Work Log:
+- Extracted the exact craft-launcher design system from clone/craft-launcher (widgets.rs/theme.rs/views.rs): frameless window (ViewportBuilder::with_decorations(false)), 48px header-as-titlebar with ViewportCommand::StartDrag + double-click maximize + 46px painter-drawn window buttons (close hover #c42b1c), Tokens (bg #121316, sunken #060607, ink #f2f1ee, muted/faint ink-alpha, line/line_strong hairlines, accent #2d81ff, invert_bg/fg, good/warn/bad), ZERO corner radius everywhere, mono HUD labels (11px Geist Mono, 0.15em), buttons 34px mono-bold caps (Primary=inverted solid, Secondary=outlined inverting on hover), badges (sunken+hairline), 4px progress bars, window_edges 1px border + edge resizing
+- Vendored the three variable fonts into crates/tile-server/assets/fonts (Inter/Archivo/GeistMono + OFL licenses) and registered 7 faces via FontTweak variation coords (wght/opsz/wdth), egui defaults kept behind as symbol fallback
+- main.rs rewritten (~2150 lines): Shell now draws header (logo + wordmark + MAP/DOWNLOADS tab cells + live dot/URL/copy + editable PORT field + window buttons), 34px footer (version/palette/port/roads + attribution), CentralPanel {20,20,18,12}; Map tab keeps tile canvas + vectocraft layers panel (restyled hairlines/sunken selection + accent bar), zoom stack anchored bottom-right; Downloads tab is now a craft-style TABLE (42px HUD header REGION/COVERAGE/SIZE/STATUS + 64px rows: display-font names, bbox mono, shared/direct, source hud_link ↗, status badges, in-row 4px progress + cancel X while downloading, DOWNLOAD/RE-DOWNLOAD/USE buttons)
+- NEW Downloads features per user: DATA FOLDER row (path + OPEN glyph + CHANGE FOLDER… native picker via rfd on Windows, background thread + mpsc), "or type a path" field + SET (works everywhere), and a LOCAL DATA table scanning the workspace (store.bin/registry.json/*.pbf/region dirs with store.bin: name/kind/size/modified/ACTIVE badge/USE button) — so the user sees what they have locally vs what to download; picking a folder with store.bin hot-swaps the store into the running server (App.set_store + App.data_dir tracking in core)
+- Settings persistence (settings.rs): port + data_dir saved to %APPDATA%\map-launcher\tile-server.json (or ~/.config) and applied on startup (flag > env > settings > defaults)
+- Windows fixes: bind_error_hint() in core maps WSAEACCES 10013 → exact guidance (netsh excludedportrange check, net stop winnat, --port) shown in a persistent server-error notice frame + console; empty-registry notice frame lists searched dir, detects WinRAR-temp exe paths ("fully extract the zip first"), links to the three fixes with OPEN DOWNLOADS + CHANGE DATA FOLDER buttons; PORT editable in the header while stopped
+- Sandbox recovery: rustup reinstalled, libxkbcommon-x11/libxcb-xkb debs re-extracted, Tanzania PBF re-downloaded (674MB, needs curl -L for geofabrik's 307), Dodoma re-extracted (116,423 roads / 531,565 buildings / 3,085 POIs)
+- Verification: clean build 0 warnings, 19/19 tests, serve check (health/stats/tile 200 2837b), xvfb screenshots (v0.5.1/01 map tab + titlebar + layers, 02 downloads table + folder rows, 03 web UI via agent-browser + road-click interaction OK, no console errors)
+- Versions bumped to 0.5.1 (Cargo.toml workspace + package.json); pushed main e412e08 + tag v0.5.1 → release run in progress
+
+Stage Summary:
+- The desktop app now visually matches craft-launcher: frameless custom titlebar, hard edges, hairlines, mono HUD labels, inverted tab/button cells, craft tables with badges and in-row progress
+- Downloads tab doubles as a data manager: browse/type any folder, see local files (stores/registries/PBFs/regions) vs the Tanzania catalog, hot-swap stores into the running server
+- Windows UX: 10013 (Hyper-V/WSL reserved port) and WinRAR-temp-store cases now have precise in-app guidance; port editable in the header; settings persist
+- v0.5.1 release building: tile-server + tile-server-cli (win/linux) + map-launcher-web
