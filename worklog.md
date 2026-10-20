@@ -231,3 +231,19 @@ Stage Summary:
 - The GUI Layers panel is now a vectorcraft-grade sub-parent tree with editing (rename/colour/opacity/zoom/lock) and isolation (Alt-click hide-others), and the map canvas has real pen tools: polygons and paths drawn in egui with vertex editing, snapping, fill/stroke styling, GeoJSON export — all persisted
 - All reference clones are submodules under clone/
 - v0.6.0 committed and pushed; tag when the user wants the release build
+---
+Task ID: 23
+Agent: Z.ai Code (main)
+Task: "push and build" — push the v0.6.0 work and trigger + verify the release build.
+
+Work Log:
+- Surveyed state first: Tasks 21 (v0.5.1 craft-launcher UI/folder browser/port fixes) and 22 (v0.6.0 vectorcraft layers tree + polygon/path drawing) were already committed; only one unpushed commit (93fb7da, sandbox auto-commit of a user-pasted Downloads-tab screenshot into upload/) and no v0.6.0 tag yet
+- Sanity-checked the unpushed image before it hit the public repo: it's the user's own screenshot of the Downloads tab (custom PBF URL row + E:\OSM local data table) — safe
+- Silenced the sandbox filemode noise inside clone/ submodules (core.fileMode=false per submodule) and reverted an unnecessary .gitmodules tweak -> working tree fully clean
+- Pushed main 8e0b2f4..93fb7da; tagged v0.6.0 on HEAD and pushed the tag -> release run 39441464594 + main build 39441434468 triggered
+- Polled the run: completed SUCCESS in ~2.5 min (Swatinem/rust-cache warm from the main-build run minutes earlier)
+- Verified release v0.6.0 via authed API + public HEAD: tile-server-v0.6.0-windows-x64.zip 13.8MB (HTTP 200, content-length 14,482,674 matches), tile-server-v0.6.0-linux-x64.tar.gz 15.2MB, map-launcher-web-v0.6.0.zip 35.7MB, each with .sha256
+
+Stage Summary:
+- v0.6.0 is live: https://github.com/20kiwy/map-launcher/releases/tag/v0.6.0 with the vectorcraft-faithful layers tree (sub-parent groups, eye/lock columns, Alt-click isolation, inline editing) + polygon/path pen tools + craft-launcher shell
+- main == tag == pushed; working tree clean; all three products (GUI+server, CLI, web) published for the tag
