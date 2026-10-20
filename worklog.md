@@ -267,3 +267,4 @@ Stage Summary:
 - Sprites fully load: POI icons, power towers, crossing signals, pattern fills — all rasterized from the embedded SVG set
 - The ocean renders from coastline data with flow-correct land/water sides, flood-proofed by landuse probes
 - v0.7.0 committed for release build
+- Release verified: run 39512112316 SUCCESS in ~2.5 min; assets tile-server-v0.7.0-windows-x64.zip 15.8MB (HTTP 200, content-length matches), linux tar 17.3MB, web zip 38.0MB + sha256s — https://github.com/20kiwy/map-launcher/releases/tag/v0.7.0
