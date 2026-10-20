@@ -209,3 +209,25 @@ Stage Summary:
 - Downloads tab doubles as a data manager: browse/type any folder, see local files (stores/registries/PBFs/regions) vs the Tanzania catalog, hot-swap stores into the running server
 - Windows UX: 10013 (Hyper-V/WSL reserved port) and WinRAR-temp-store cases now have precise in-app guidance; port editable in the header; settings persist
 - v0.5.1 release building: tile-server + tile-server-cli (win/linux) + map-launcher-web
+---
+Task ID: 22
+Agent: Z.ai Code (main)
+Task: v0.6.0 — study the vectorcraft submodule and bring its vector drawing engine feel into the GUI: sub-parent layer trees styled like the reference, layer editing + isolation for easy drawing, and a real polygon/path drawing tool in egui; also move every clone under clone/ as submodules.
+
+Work Log:
+- Submodules: moved vendor/openstreetmap-carto -> clone/openstreetmap-carto (git submodule deinit + git mv, .gitmodules fixed) — all three reference repos (craft-launcher, vectorcraft, openstreetmap-carto) now live under clone/ as submodules; the "dirty" submodule flags are sandbox filemode noise (644->755), nothing to commit
+- Studied clone/vectorcraft/crates/ui-egui/src/panels/layers.rs (3195 lines): Row/depth/open/dim model, push_rows flattening, eye+lock 25px columns with hairline separators, colour bars, chevron triangles, Alt-click Hide/Show Others (isolation), inline rename, bottom bar icon buttons; and crates/doc/src/node.rs LiveShape::Polygon for the pen-tool feel
+- Engine (tile-server-core/layers.rs): catalog rebuilt as a real sub-parent tree — terrain > landuse, water > areas/ways, transport > roads > casing/fill/oneway/labels + rail, places > pois (16 defs; leaf ids stable so renderer + /api/layers unchanged); added top_level/children_of/descendants_of/top_ancestor_of helpers + LayerVis.locked (panel-only lock)
+- GUI main.rs: PanelState rewritten around Row{Src::Engine(LayerDef)|AnnoGroup|Anno(usize)} — eye column (green painted eye), lock column (painted padlock, ghost on hover), cascade eye toggles for groups (transport -> roads -> children verified via /api/layers), dim propagation from hidden ancestors, Alt-click eye = isolate_top (hide every other top-level group incl. Annotations, or show all), lock toggles cascade and gate the properties editor
+- NEW annotations.rs: Anno model (id/name/kind polygon|path/lonlat pts/color/opacity/width/filled/visible/locked), persisted to config dir annotations.json, GeoJSON export to the workspace; haversine length + shoelace area stats
+- NEW pen tools on the canvas (toolbar cells SELECT | POLYGON | PATH, same hard-cell style as the header tabs): click adds vertices, click-first-anchor (10px snap ring) / Enter / double-click closes, Backspace undo, Esc cancel, right-drag pans while drawing; work-in-progress overlay (solid segments, dashed rubber band, anchor squares); finished drawings paint with ear-clipped fill (concave-safe) + stroke and get vectorcraft-style draggable vertex handles when selected; whole-shape drag to move; Delete via panel trash
+- Layers tree gains the synthetic Annotations group: rows with kind chip + "N pts" badge, double-click inline rename, drawing properties panel (name, paint hex, opacity, stroke width, fill checkbox, geometry stats, Fit view, Export GeoJSON, Delete); bottom bar shows "16 layers · N drawings" with painted polygon/path/fit/trash mini buttons
+- Fixed en route: tool cells were invisible (laid out after a right_to_left with_layout that consumes the row — moved inside, reversed order), let-chains (edition 2021), lifetimes (Row owns LayerDef now), f64/f32 clamp, 4-point line_segment, painter borrow (clone), "1 drawings" pluralization, layer count now totals the catalog (16) not the visible rows
+- Verification: cargo build clean, 19/19 tests green; Xvfb + python-xlib XTEST drive script: drew Polygon 1 (4 pts, auto-selected, properties panel + handles shown), vertex-dragged its corner (pts moved in annotations.json), path tool click sequence logged, group eye cascade checked via /api/layers ground truth; screenshots/v0.6.0 (01 map tab tree + seeded Market area/Survey route drawings, 02 downloads table, 03 selected polygon + drawing properties); web UI re-checked against the new engine via agent-browser (tiles, stats, road click polyline — no console errors)
+- Sandbox note: XTEST keyboard (Enter/Esc/Alt) never reaches winit under this Xvfb (no xkb events) — key paths are code-verified only; and background processes are reaped between tool calls here, so the "flaky deaths" seen mid-investigation were the sandbox reaper, not crashes
+- Versions bumped to 0.6.0 (workspace + both package.json); pushed main 1981b83
+
+Stage Summary:
+- The GUI Layers panel is now a vectorcraft-grade sub-parent tree with editing (rename/colour/opacity/zoom/lock) and isolation (Alt-click hide-others), and the map canvas has real pen tools: polygons and paths drawn in egui with vertex editing, snapping, fill/stroke styling, GeoJSON export — all persisted
+- All reference clones are submodules under clone/
+- v0.6.0 committed and pushed; tag when the user wants the release build
