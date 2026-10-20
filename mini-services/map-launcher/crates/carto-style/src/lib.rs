@@ -32,6 +32,10 @@ pub static EMBEDDED_STYLE: Dir<'static> =
 pub static EMBEDDED_SYMBOLS: Dir<'static> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../assets/symbols");
 
+/// Verbatim `assets/patterns/**` (openstreetmap-carto polygon pattern SVGs).
+pub static EMBEDDED_PATTERNS: Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../assets/patterns");
+
 /// Verbatim `assets/fonts/*.ttf` (guaranteed fallback faces).
 pub static EMBEDDED_FONTS: Dir<'static> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../assets/fonts");

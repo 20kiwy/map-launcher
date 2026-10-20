@@ -4,6 +4,7 @@
 
 pub mod download;
 pub mod layers;
+pub mod sprites;
 
 use carto_core::{road_class_name, Line, Store};
 use carto_math::{lonlat_to_merc, tile_bbox, ClipRect};
@@ -71,6 +72,8 @@ pub struct App {
     pub font: Font,
     pub font_bold: Font,
     pub symbol_count: usize,
+    /// Cached SVG sprite rasterizer (POI icons + landcover patterns).
+    pub sprites: sprites::Sprites,
     pub cache: Mutex<TileCache>,
     pub hits: AtomicUsize,
     pub misses: AtomicUsize,
@@ -107,6 +110,10 @@ impl App {
             landuse: store.landuse.len(),
             buildings: store.buildings.len(),
             pois: store.pois.len(),
+            places: store.places.len(),
+            ocean: store.ocean.len(),
+            islands: store.islands.len(),
+            admin: store.admin.len(),
             bounds: store.bbox,
         }
     }
@@ -126,6 +133,10 @@ pub struct StatsDto {
     pub landuse: usize,
     pub buildings: usize,
     pub pois: usize,
+    pub places: usize,
+    pub ocean: usize,
+    pub islands: usize,
+    pub admin: usize,
     pub bounds: [f64; 4],
 }
 
@@ -239,9 +250,9 @@ fn class_min_zoom(class: u8) -> u8 {
         9 => 13,  // tertiary_link
         10 => 13, // residential
         11 => 13, // unclassified
-        12 => 14, // service
-        13 => 13, // living_street
-        14 => 13, // pedestrian
+        12 => 13, // living_street
+        13 => 13, // pedestrian
+        14 => 14, // service
         15 => 12, // track
         16 => 14, // footway
         17 => 14, // path
@@ -265,9 +276,9 @@ fn road_width(class: u8, z: u8) -> f32 {
         9 => 1.0,  // tertiary_link
         10 => 1.1, // residential
         11 => 0.9, // unclassified
-        12 => 0.6, // service
-        13 => 1.0, // living_street
-        14 => 1.0, // pedestrian
+        12 => 1.0, // living_street
+        13 => 1.0, // pedestrian
+        14 => 0.6, // service
         15 => 0.8, // track
         16 => 0.5, // footway
         17 => 0.5, // path
@@ -277,6 +288,382 @@ fn road_width(class: u8, z: u8) -> f32 {
     };
     let grow = 1.0 + f32::from(z.saturating_sub(10)) * 0.35;
     base * grow
+}
+
+/// Dashed stroke (tunnels, ferries, golf paths…).
+fn draw_line_dashed(
+    pixmap: &mut Pixmap,
+    pts: &[(f32, f32)],
+    width: f32,
+    color: Color,
+    dash: &[f32],
+    clip_px: &ClipRect,
+) {
+    if pts.len() < 2 || dash.is_empty() {
+        return draw_line(pixmap, pts, width, color, clip_px);
+    }
+    let mut pb = PathBuilder::new();
+    pb.move_to(pts[0].0, pts[0].1);
+    for p in &pts[1..] {
+        pb.line_to(p.0, p.1);
+    }
+    let Some(path) = pb.finish() else { return };
+    let mut stroke = Stroke { width: width.max(0.4), ..Default::default() };
+    stroke.dash = tiny_skia::StrokeDash::new(dash.to_vec(), 0.0);
+    let paint = Paint { shader: tiny_skia::Shader::SolidColor(color), anti_alias: true, ..Default::default() };
+    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+}
+
+/// Polygon filled with a tiled SVG pattern (landcover-area-symbols).
+fn draw_polygon_pattern(
+    pixmap: &mut Pixmap,
+    ring_px: &[(f32, f32)],
+    base: Color,
+    pattern: &Pixmap,
+    alpha: f32,
+    clip_px: &ClipRect,
+) {
+    if ring_px.len() < 3 {
+        return;
+    }
+    // Base fill first (carto paints polygon-fill + polygon-pattern-file).
+    draw_polygon(pixmap, ring_px, base, clip_px);
+    let Some(path) = ring_path(ring_px) else { return };
+    let shader = tiny_skia::Pattern::new(
+        pattern.as_ref(),
+        tiny_skia::SpreadMode::Repeat,
+        tiny_skia::FilterQuality::Bilinear,
+        alpha.clamp(0.0, 1.0),
+        Transform::identity(),
+    );
+    let paint = Paint { shader, anti_alias: true, ..Default::default() };
+    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+}
+
+fn ring_path(ring_px: &[(f32, f32)]) -> Option<tiny_skia::Path> {
+    if ring_px.len() < 3 {
+        return None;
+    }
+    let mut pb = PathBuilder::new();
+    pb.move_to(ring_px[0].0, ring_px[0].1);
+    for p in &ring_px[1..] {
+        pb.line_to(p.0, p.1);
+    }
+    pb.close();
+    pb.finish()
+}
+
+/// A small filled circle (tree, crossing, POI dot…).
+fn draw_dot(pixmap: &mut Pixmap, x: f32, y: f32, r: f32, fill: Color, ring: Option<Color>) {
+    let mut pb = PathBuilder::new();
+    pb.push_circle(x, y, r);
+    if let Some(path) = pb.finish() {
+        let paint = Paint { shader: tiny_skia::Shader::SolidColor(fill), anti_alias: true, ..Default::default() };
+        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+    if let Some(rc) = ring {
+        let mut pbr = PathBuilder::new();
+        pbr.push_circle(x, y, r);
+        if let Some(path) = pbr.finish() {
+            let paint = Paint { shader: tiny_skia::Shader::SolidColor(rc), anti_alias: true, ..Default::default() };
+            pixmap.stroke_path(&path, &paint, &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
+        }
+    }
+}
+
+/// Blit a sprite pixmap centered at (x, y), scaled to fit `box_px`.
+fn blit_sprite(pixmap: &mut Pixmap, sprite: &Pixmap, x: f32, y: f32, box_px: f32, alpha: f32) {
+    let (w, h) = (sprite.width() as f32, sprite.height() as f32);
+    if w <= 0.0 || h <= 0.0 || box_px <= 0.0 {
+        return;
+    }
+    let s = (box_px / w).min(box_px / h);
+    let paint = tiny_skia::PixmapPaint {
+        opacity: alpha.clamp(0.0, 1.0),
+        blend_mode: tiny_skia::BlendMode::SourceOver,
+        quality: tiny_skia::FilterQuality::Bilinear,
+    };
+    let t = Transform::from_translate(x - w * s / 2.0, y - h * s / 2.0)
+        .post_concat(Transform::from_scale(s, s));
+    pixmap.draw_pixmap(0, 0, sprite.as_ref(), &paint, t, None);
+}
+
+/// One rasterized, tinted glyph as its own pixmap (for along-path text).
+fn glyph_pixmap(font: &Font, ch: char, size: f32, col: (u8, u8, u8), alpha: u8) -> Option<Pixmap> {
+    let (m, bmp) = font.rasterize(ch, size);
+    if bmp.is_empty() || m.width == 0 || m.height == 0 {
+        return None;
+    }
+    // generous canvas: glyph + halo spread
+    let pad = 2usize;
+    let (w, h) = (m.width + pad * 2, m.height + pad * 2);
+    let mut pm = Pixmap::new(w as u32, h as u32)?;
+    {
+        let data = pm.data_mut();
+        for row in 0..m.height {
+            for cx in 0..m.width {
+                let cov = bmp[row * m.width + cx] as u32 * alpha as u32 / 255;
+                if cov == 0 {
+                    continue;
+                }
+                let i = ((row + pad) * w + cx + pad) * 4;
+                data[i] = col.0;
+                data[i + 1] = col.1;
+                data[i + 2] = col.2;
+                data[i + 3] = cov.min(255) as u8;
+            }
+        }
+    }
+    Some(pm)
+}
+
+/// Text following a polyline (carto text-placement: line). Glyphs read
+/// left→right; when the path runs backwards it is walked in reverse so labels
+/// stay upright, matching carto's placement flip behaviour.
+fn draw_text_along(
+    pixmap: &mut Pixmap,
+    font: &Font,
+    text: &str,
+    pts: &[(f32, f32)],
+    size: f32,
+    color: (u8, u8, u8),
+    halo: Option<(u8, u8, u8)>,
+    clip_px: &ClipRect,
+) {
+    if text.is_empty() || pts.len() < 2 {
+        return;
+    }
+    // per-glyph advances
+    let mut adv = Vec::with_capacity(text.chars().count());
+    let mut total_w = 0f32;
+    for ch in text.chars() {
+        let (m, _) = font.rasterize(ch, size);
+        adv.push(m.advance_width);
+        total_w += m.advance_width;
+    }
+    if total_w < 2.0 {
+        return;
+    }
+
+    // cumulative segments (unit direction + length)
+    let mut segs: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
+    let mut total_len = 0f32;
+    for w in pts.windows(2) {
+        let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > 0.01 {
+            segs.push((w[0].0, w[0].1, dx / len, dy / len, len));
+            total_len += len;
+        }
+    }
+    if segs.is_empty() || total_len < total_w * 0.8 {
+        return; // line too short for carto-style placement
+    }
+
+    // Flip so text reads left→right (screen x grows).
+    if segs.iter().map(|s| s.2 * s.4).sum::<f32>() < 0.0 {
+        segs.reverse();
+        for s in &mut segs {
+            s.2 = -s.2;
+            s.3 = -s.3;
+        }
+    }
+
+    let at = |dist: f32| -> (f32, f32, f32, f32) {
+        let mut acc = 0f32;
+        for s in &segs {
+            if dist <= acc + s.4 {
+                let t = (dist - acc).min(s.4);
+                return (s.0 + s.2 * t, s.1 + s.3 * t, s.2, s.3);
+            }
+            acc += s.4;
+        }
+        let s = segs[segs.len() - 1];
+        (s.0 + s.2 * s.4, s.1 + s.3 * s.4, s.2, s.3)
+    };
+    let blit = |pixmap: &mut Pixmap, g: &Pixmap, px: f32, py: f32, angle: f32| {
+        let (gw, gh) = (g.width() as f32, g.height() as f32);
+        let sin = angle.sin();
+        let cos = angle.cos();
+        // translate(px,py) * rotate(angle) * translate(-center) — tiny_skia's
+        // from_row is [sx kx tx / ky sy ty], rotation is (cos,-sin,sin,cos).
+        let t = Transform::from_row(cos, -sin, sin, cos, px, py)
+            .post_concat(Transform::from_translate(-gw / 2.0, -gh / 2.0));
+        pixmap.draw_pixmap(0, 0, g.as_ref(), &tiny_skia::PixmapPaint::default(), t, None);
+    };
+
+    let mut d = (total_len / 2.0 - total_w / 2.0).max(2.0);
+    let end = total_len - 2.0;
+    for (i, ch) in text.chars().enumerate() {
+        if d > end {
+            break;
+        }
+        let (px, py, ux, uy) = at(d);
+        let angle = uy.atan2(ux);
+        if let Some(hc) = halo {
+            if let Some(g) = glyph_pixmap(font, ch, size, hc, 190) {
+                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                    blit(pixmap, &g, px + dx, py + dy, angle);
+                }
+            }
+        }
+        if let Some(g) = glyph_pixmap(font, ch, size, color, 255) {
+            blit(pixmap, &g, px, py, angle);
+        }
+        d += adv[i];
+    }
+    let _ = clip_px;
+}
+
+/// A road ref shield: rounded plate in the class shield colour + white ref.
+fn draw_shield(pixmap: &mut Pixmap, font: &Font, refs: &str, cx: f32, cy: f32, bg: (u8, u8, u8), clip_px: &ClipRect) {
+    if refs.is_empty() {
+        return;
+    }
+    let mut tw = 0f32;
+    for ch in refs.chars() {
+        let (m, _) = font.rasterize(ch, 9.0);
+        tw += m.advance_width;
+    }
+    let (w, h) = (tw + 7.0, 13.0);
+    let rect = tiny_skia::Rect::from_xywh(cx - w / 2.0, cy - h / 2.0, w, h);
+    let mut pb = PathBuilder::new();
+    if let Some(rc) = rect {
+        pb.push_rect(rc);
+    }
+    if let Some(path) = pb.finish() {
+        let paint = Paint { shader: tiny_skia::Shader::SolidColor(Color::from_rgba8(bg.0, bg.1, bg.2, 245)), anti_alias: true, ..Default::default() };
+        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        let ring = Paint { shader: tiny_skia::Shader::SolidColor(Color::from_rgba8(255, 255, 255, 180)), anti_alias: true, ..Default::default() };
+        pixmap.stroke_path(&path, &ring, &Stroke { width: 0.8, ..Default::default() }, Transform::identity(), None);
+    }
+    draw_text(pixmap, font, refs, cx, cy + 3.2, 9.0, (255, 255, 255), None, clip_px);
+}
+
+/// Draw text centered at (cx, baseline) with optional halo.
+fn draw_text(
+    pixmap: &mut Pixmap,
+    font: &Font,
+    text: &str,
+    cx: f32,
+    baseline: f32,
+    size: f32,
+    color: (u8, u8, u8),
+    halo: Option<(u8, u8, u8)>,
+    clip_px: &ClipRect,
+) {
+    if text.is_empty() {
+        return;
+    }
+    // Quick reject: text bbox (approx by advance) outside clip.
+    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::new();
+    let mut total_w = 0f32;
+    for ch in text.chars() {
+        let (m, bmp) = font.rasterize(ch, size);
+        total_w += m.advance_width;
+        glyphs.push((m, bmp));
+    }
+    let mut pen = cx - total_w / 2.0;
+    let put = |pixmap: &mut Pixmap, pen: f32, col: (u8, u8, u8), alpha: u8| {
+        let mut x = pen;
+        for (m, bmp) in &glyphs {
+            let ox = (x + m.xmin as f32).round() as i32;
+            let oy = (baseline - (m.ymin as f32 + m.height as f32)).round() as i32;
+            if !bmp.is_empty() {
+                blit_coverage(pixmap, bmp, m.width, m.height, ox, oy, col, alpha);
+            }
+            x += m.advance_width;
+        }
+    };
+    if let Some(hc) = halo {
+        for &(dx, _dy) in &[
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (0.0, -1.0),
+            (0.0, 1.0),
+            (-1.0, -1.0),
+            (1.0, -1.0),
+            (-1.0, 1.0),
+            (1.0, 1.0),
+        ] {
+            put(pixmap, pen + dx, hc, 200);
+        }
+    }
+    let _ = clip_px; // glyphs are small; blit clips per-pixel already
+    put(pixmap, pen, color, 255);
+    let _ = &mut pen;
+}
+
+/// Landcover kind -> palette variable (landcover.mss + amenity area fills).
+fn landuse_color_var(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "forest" => "forest",
+        "farmland" => "farmland",
+        "farmyard" => "farmyard",
+        "farm" => "farmyard",
+        "grass" | "meadow" | "village_green" | "garden" | "recreation_ground"
+        | "pitch" | "playground" | "golf_course" | "mini_golf" | "dog_park" | "common" => "grass",
+        "park" => "park",
+        "orchard" | "vineyard" | "plant_nursery" => "orchard",
+        "allotments" => "allotments",
+        "scrub" | "heath" => "scrub",
+        "wetland" => "wetland",
+        "residential" | "garage" | "garages" => "residential",
+        "retail" | "marketplace" => "retail",
+        "commercial" => "commercial",
+        "industrial" | "railway" | "port" => "industrial",
+        "school" => "school",
+        "hospital" => "hospital",
+        "college" | "university" => "college",
+        "place_of_worship" => "religion",
+        "cemetery" | "grave_yard" | "christian" | "churchyard" => "cemetery",
+        "quarry" => "quarry",
+        "construction" => "construction",
+        "parking" | "parking_space" => "pedestrian-fill",
+        "platform" => "platform",
+        "sand" | "beach" | "shingle" => "sand",
+        "bare_rock" | "scree" => "bare_rock",
+        "mud" => "mud",
+        "marina" => "marina",
+        "quay" | "wharf" => "quay",
+        _ => return None,
+    })
+}
+
+/// waterway class -> (min_zoom, width ladder). carto water-lines zooms.
+fn waterway_style(class: u8, z: u8) -> Option<f32> {
+    let width = match class {
+        carto_core::WATER_RIVER => match z {
+            0..=4 => return None,
+            5..=6 => 0.6,
+            7 => 0.9,
+            8..=9 => 1.4,
+            10..=11 => 2.0,
+            12..=13 => 2.8,
+            14..=15 => 3.8,
+            16..=17 => 5.5,
+            _ => 7.5,
+        },
+        carto_core::WATER_CANAL => if z < 8 { return None } else { match z {
+            8..=9 => 1.2,
+            10..=11 => 1.8,
+            12..=13 => 2.6,
+            14..=15 => 3.4,
+            16..=17 => 4.8,
+            _ => 6.5,
+        }},
+        carto_core::WATER_STREAM => if z < 12 { return None } else { match z {
+            12..=13 => 1.2,
+            14 => 1.7,
+            15..=16 => 2.2,
+            _ => 3.0,
+        }},
+        carto_core::WATER_DITCH | carto_core::WATER_DRAIN => if z < 13 { return None } else {
+            if z < 15 { 0.9 } else { 1.6 }
+        },
+        _ => if z < 13 { return None } else { 0.9 },
+    };
+    Some(width)
 }
 
 fn draw_arrow_marker(pixmap: &mut Pixmap, x: f32, y: f32, ux: f32, uy: f32, color: Color) {
@@ -352,13 +739,7 @@ fn draw_polygon(pixmap: &mut Pixmap, ring_px: &[(f32, f32)], color: Color, clip_
     if ring_px.len() < 3 {
         return;
     }
-    let mut pb = PathBuilder::new();
-    pb.move_to(ring_px[0].0, ring_px[0].1);
-    for p in &ring_px[1..] {
-        pb.line_to(p.0, p.1);
-    }
-    pb.close();
-    let Some(path) = pb.finish() else { return };
+    let Some(path) = ring_path(ring_px) else { return };
     let paint = Paint { shader: tiny_skia::Shader::SolidColor(color), anti_alias: true, ..Default::default() };
     pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     let _ = clip_px;
@@ -401,59 +782,6 @@ fn blit_coverage(pixmap: &mut Pixmap, bmp: &[u8], w: usize, h: usize, ox: i32, o
     }
 }
 
-/// Draw text centered at (cx, baseline) with optional halo.
-fn draw_text(
-    pixmap: &mut Pixmap,
-    font: &Font,
-    text: &str,
-    cx: f32,
-    baseline: f32,
-    size: f32,
-    color: (u8, u8, u8),
-    halo: Option<(u8, u8, u8)>,
-    clip_px: &ClipRect,
-) {
-    if text.is_empty() {
-        return;
-    }
-    // Quick reject: text bbox (approx by advance) outside clip.
-    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::new();
-    let mut total_w = 0f32;
-    for ch in text.chars() {
-        let (m, bmp) = font.rasterize(ch, size);
-        total_w += m.advance_width;
-        glyphs.push((m, bmp));
-    }
-    let mut pen = cx - total_w / 2.0;
-    let put = |pixmap: &mut Pixmap, pen: f32, col: (u8, u8, u8), alpha: u8| {
-        let mut x = pen;
-        for (m, bmp) in &glyphs {
-            let ox = (x + m.xmin as f32).round() as i32;
-            let oy = (baseline - (m.ymin as f32 + m.height as f32)).round() as i32;
-            if !bmp.is_empty() {
-                blit_coverage(pixmap, bmp, m.width, m.height, ox, oy, col, alpha);
-            }
-            x += m.advance_width;
-        }
-    };
-    if let Some(hc) = halo {
-        for &(dx, _dy) in &[
-            (-1.0, 0.0),
-            (1.0, 0.0),
-            (0.0, -1.0),
-            (0.0, 1.0),
-            (-1.0, -1.0),
-            (1.0, -1.0),
-            (-1.0, 1.0),
-            (1.0, 1.0),
-        ] {
-            put(pixmap, pen + dx, hc, 200);
-        }
-    }
-    let _ = clip_px; // glyphs are small; blit clips per-pixel already
-    put(pixmap, pen, color, 255);
-    let _ = &mut pen;
-}
 pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u32, y: u32) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(256, 256)?;
     let land = app.palette.get("land-color").unwrap_or(carto_style::Rgba::rgb(0xf2, 0xef, 0xe9));
@@ -479,46 +807,48 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
     let in_tile = |b: &[f32; 4]| b[2] >= tw && b[0] <= te && b[3] >= ts && b[1] <= tn;
 
     let line_px = |pts: &Vec<u32>| -> Vec<(f32, f32)> { pts.iter().map(|&i| project(i)).collect() };
+    let water = app.palette.get("water-color").unwrap_or(carto_style::Rgba::rgb(0xaa, 0xd3, 0xdf));
+    let gray_land = vis.color("islands", land);
 
-    /* ---- landuse polygons ---- */
-    let lu_colors: &[(&str, &str)] = &[
-        ("forest", "forest"),
-        ("farmland", "farmland"),
-        ("farmyard", "farmyard"),
-        ("grass", "grass"),
-        ("park", "park"),
-        ("garden", "park"),
-        ("pitch", "grass"),
-        ("golf_course", "grass"),
-        ("playground", "grass"),
-        ("orchard", "orchard"),
-        ("allotments", "allotments"),
-        ("scrub", "scrub"),
-        ("residential", "residential"),
-        ("retail", "retail"),
-        ("commercial", "commercial"),
-        ("industrial", "industrial"),
-        ("school", "residential"),
-        ("hospital", "residential"),
-        ("college", "residential"),
-        ("university", "residential"),
-        ("place_of_worship", "residential"),
-        ("marketplace", "retail"),
-        ("sand", "farmland"),
-        ("beach", "farmland"),
-    ];
-    if vis.on_with_default("landuse", 8, 19, z) {
+    /* ---- ocean (coastline rings closed against the extract bbox) ---- */
+    if vis.on_with_default("ocean", 0, 19, z) {
+        let oa = vis.alpha("ocean");
+        let oc = vis.color("ocean", water);
+        for a in &store.ocean {
+            if in_tile(&a.bbox) {
+                let ring = line_px(&a.pts);
+                if ring.len() >= 3 {
+                    draw_polygon(&mut pixmap, &ring, skia_color(oc, oa), &clip);
+                }
+            }
+        }
+    }
+
+    /* ---- islands (closed coastline rings -> land over the ocean) ---- */
+    if vis.on_with_default("islands", 0, 19, z) {
+        let ia = vis.alpha("islands");
+        for a in &store.islands {
+            if in_tile(&a.bbox) {
+                let ring = line_px(&a.pts);
+                if ring.len() >= 3 {
+                    draw_polygon(&mut pixmap, &ring, skia_color(gray_land, ia), &clip);
+                }
+            }
+        }
+    }
+
+    /* ---- landuse polygons (landcover.mss; majors appear below z8) ---- */
+    if vis.on_with_default("landuse", 4, 19, z) {
         let la = vis.alpha("landuse");
         for a in &store.landuse {
-            if z < 8 || !in_tile(&a.bbox) {
+            if !in_tile(&a.bbox) {
                 continue;
             }
-            let is_major = matches!(a.kind.as_str(), "forest" | "farmland" | "scrub");
+            let is_major = matches!(a.kind.as_str(), "forest" | "farmland" | "scrub" | "grass" | "residential" | "industrial" | "sand" | "wetland" | "heath" | "bare_rock");
             if z < 10 && !is_major {
                 continue;
             }
-            let var = lu_colors.iter().find(|(k, _)| *k == a.kind).map(|(_, v)| *v);
-            let Some(var) = var else { continue };
+            let Some(var) = landuse_color_var(&a.kind) else { continue };
             let Some(c) = app.palette.get(var) else { continue };
             let c = vis.color("landuse", c);
             let ring = line_px(&a.pts);
@@ -528,11 +858,63 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
         }
     }
 
+    /* ---- landcover area symbols (pattern fills) ---- */
+    if vis.on_with_default("landcover-patterns", 9, 19, z) && z >= 9 {
+        let pa = vis.alpha("landcover-patterns");
+        for a in &store.landuse {
+            if z < 10 && !matches!(a.kind.as_str(), "forest") {
+                continue;
+            }
+            let Some(pat) = sprites::landcover_pattern(&a.kind) else { continue };
+            let Some(base) = landuse_color_var(&a.kind).and_then(|v| app.palette.get(v)) else { continue };
+            let base = vis.color("landcover-patterns", base);
+            if let Some(tile) = app.sprites.pattern(pat) {
+                if in_tile(&a.bbox) {
+                    let ring = line_px(&a.pts);
+                    if ring.len() >= 3 {
+                        draw_polygon_pattern(&mut pixmap, &ring, skia_color(base, 1.0), &tile, pa, &clip);
+                    }
+                }
+            }
+        }
+    }
+
+    /* ---- protected areas (nature reserves) ---- */
+    if vis.on_with_default("protected-areas", 9, 19, z) && z >= 9 {
+        let pa = vis.alpha("protected-areas");
+        let pc = app.palette.get("protected-areas").unwrap_or(carto_style::Rgba::rgba(0x9c, 0xd4, 0x9c, 255));
+        let pc = vis.color("protected-areas", pc);
+        for a in &store.protected {
+            if in_tile(&a.bbox) {
+                let ring = line_px(&a.pts);
+                if ring.len() >= 3 {
+                    draw_polygon(&mut pixmap, &ring, skia_color(pc, 0.30 * pa), &clip);
+                }
+            }
+        }
+    }
+
+    /* ---- highway areas (plazas) under everything road-ish ---- */
+    if vis.on_with_default("road-areas", 13, 19, z) && z >= 13 {
+        let aa = vis.alpha("road-areas");
+        let pf = app.palette.get("pedestrian-fill").unwrap_or(carto_style::Rgba::rgb(0xdd, 0xdd, 0xdd));
+        let pf = vis.color("road-areas", pf);
+        let cf = app.palette.get("residential-casing").unwrap_or(carto_style::Rgba::rgb(0xbb, 0xbb, 0xbb));
+        for a in &store.road_areas {
+            if in_tile(&a.bbox) {
+                let ring = line_px(&a.pts);
+                if ring.len() >= 3 {
+                    draw_polygon(&mut pixmap, &ring, skia_color(pf, aa), &clip);
+                    draw_polygon(&mut pixmap, &ring, skia_color(cf, 0.8 * aa), &clip);
+                }
+            }
+        }
+    }
+
     /* ---- water areas ---- */
     if vis.on_with_default("water-areas", 7, 19, z) && z >= 7 {
         let wa = vis.alpha("water-areas");
-        let wc = app.palette.get("water-color").unwrap_or(carto_style::Rgba::rgb(0xaa, 0xd3, 0xdf));
-        let wc = vis.color("water-areas", wc);
+        let wc = vis.color("water-areas", water);
         for a in &store.water_areas {
             if in_tile(&a.bbox) {
                 let ring = line_px(&a.pts);
@@ -543,23 +925,54 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
         }
     }
 
-    /* ---- waterways ---- */
-    if vis.on_with_default("waterways", 8, 19, z) && z >= 8 {
+    /* ---- water barriers (dams, weirs, breakwaters) ---- */
+    if vis.on_with_default("water-barriers", 13, 19, z) && z >= 13 {
+        let ba = vis.alpha("water-barriers");
+        let fill = app.palette.get("dam").unwrap_or(carto_style::Rgba::rgb(0xad, 0xad, 0xad));
+        let fill = vis.color("water-barriers", fill);
+        let line = app.palette.get("dam-line").unwrap_or(carto_style::Rgba::rgb(0x5e, 0x5e, 0x5e));
+        for b in &store.water_barriers {
+            if !in_tile(&b.bbox) {
+                continue;
+            }
+            let pts = line_px(&b.pts);
+            match b.class {
+                0 => {
+                    if b.area && pts.len() >= 3 {
+                        draw_polygon(&mut pixmap, &pts, skia_color(fill, ba), &clip);
+                    }
+                    draw_line(&mut pixmap, &pts, if z >= 15 { 2.2 } else { 1.6 }, skia_color(line, ba), &clip);
+                }
+                1 => draw_line(&mut pixmap, &pts, 1.1, skia_color(vis.color("water-barriers", app.palette.get("weir-line").unwrap_or(carto_style::Rgba::rgb(0xaa, 0xaa, 0xaa))), ba), &clip),
+                _ => draw_line(&mut pixmap, &pts, 1.4, skia_color(line, ba), &clip),
+            }
+        }
+    }
+
+    /* ---- piers ---- */
+    if vis.on_with_default("piers", 12, 19, z) && z >= 12 {
+        let pa = vis.alpha("piers");
+        let pc = app.palette.get("pier").unwrap_or(carto_style::Rgba::rgb(0xad, 0xad, 0xad));
+        let pc = vis.color("piers", pc);
+        for p in &store.piers {
+            if !in_tile(&p.bbox) {
+                continue;
+            }
+            let pts = line_px(&p.pts);
+            if p.area && pts.len() >= 3 {
+                draw_polygon(&mut pixmap, &pts, skia_color(pc, pa), &clip);
+            } else {
+                draw_line(&mut pixmap, &pts, if z >= 15 { 2.4 } else { 1.6 }, skia_color(pc, pa), &clip);
+            }
+        }
+    }
+
+    /* ---- waterways (class ladder; big rivers from z5) ---- */
+    if vis.on_with_default("waterways", 5, 19, z) {
         let wa = vis.alpha("waterways");
-        let wc = app.palette.get("water-color").unwrap_or(carto_style::Rgba::rgb(0xaa, 0xd3, 0xdf));
-        let wc = vis.color("waterways", wc);
-        let width = match z {
-            8 => 0.7,
-            9 => 1.2,
-            10 => 1.5,
-            11 => 1.8,
-            12 => 2.3,
-            13 => 3.0,
-            14 => 3.5,
-            15 => 4.5,
-            _ => 6.0,
-        };
+        let wc = vis.color("waterways", water);
         for wway in &store.waterways {
+            let Some(width) = waterway_style(wway.class, z) else { continue };
             if !in_tile(&wway.bbox) {
                 continue;
             }
@@ -593,24 +1006,49 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
         }
     }
 
-    /* ---- railways (casing) ---- */
-    if vis.on_with_default("rail", 9, 19, z) && z >= 9 {
-        let ra = vis.alpha("rail");
-        let rc = vis.color("rail", carto_style::Rgba::rgb(0x8a, 0x8a, 0x8a));
-        let width = match z {
-            9 | 10 => 0.9,
-            11 | 12 => 1.4,
-            13 | 14 => 2.0,
-            _ => 2.6,
-        };
-        for r in &store.railways {
-            if in_tile(&r.bbox) {
-                draw_line(&mut pixmap, &line_px(&r.pts), width, skia_color(rc, ra), &clip);
+    /* ---- aeroways (runways / taxiways / aprons) ---- */
+    if vis.on_with_default("aeroways", 10, 19, z) && z >= 10 {
+        let aa = vis.alpha("aeroways");
+        let rf = app.palette.get("runway").unwrap_or(carto_style::Rgba::rgb(0xd5, 0xd3, 0xcc));
+        let rf = vis.color("aeroways", rf);
+        for a in &store.aeroways {
+            if !in_tile(&a.bbox) {
+                continue;
+            }
+            let pts = line_px(&a.pts);
+            match a.class {
+                0 => draw_line(&mut pixmap, &pts, if z >= 13 { 5.5 } else { 3.0 }, skia_color(rf, aa), &clip),
+                1 => if z >= 11 {
+                    draw_line(&mut pixmap, &pts, if z >= 13 { 3.0 } else { 1.8 }, skia_color(rf, 0.9 * aa), &clip);
+                },
+                _ => {
+                    if a.area && pts.len() >= 3 {
+                        draw_polygon(&mut pixmap, &pts, skia_color(rf, aa), &clip);
+                    } else {
+                        draw_line(&mut pixmap, &pts, 2.0, skia_color(rf, aa), &clip);
+                    }
+                }
             }
         }
     }
 
-    /* ---- roads: casings then fills ---- */
+    /* ---- power lines ---- */
+    if vis.on_with_default("power-lines", 13, 19, z) && z >= 13 {
+        let pa = vis.alpha("power-lines");
+        let pc = app.palette.get("power-line-color").unwrap_or(carto_style::Rgba::rgb(0x88, 0x88, 0x88));
+        let pc = vis.color("power-lines", pc);
+        for p in &store.power {
+            if z < 15 && p.class != 0 {
+                continue;
+            }
+            if !in_tile(&p.bbox) {
+                continue;
+            }
+            draw_line(&mut pixmap, &line_px(&p.pts), if p.class == 0 { 1.0 } else { 0.7 }, skia_color(pc, pa), &clip);
+        }
+    }
+
+    /* ---- roads: casings then fills (tunnels first, bridges last) ---- */
     let casing_for = |class: u8| -> carto_style::Rgba {
         let name = road_class_name(class);
         let var = match name {
@@ -618,7 +1056,7 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
             "trunk" | "trunk_link" => "trunk-casing",
             "primary" | "primary_link" => "primary-casing",
             "secondary" | "secondary_link" => "secondary-casing",
-            "tertiary" => "tertiary-casing",
+            "tertiary" | "tertiary_link" => "tertiary-casing",
             "residential" | "unclassified" | "service" => "residential-casing",
             "living_street" | "pedestrian" => "residential-casing",
             "track" => "default-casing",
@@ -641,7 +1079,7 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
             "trunk" | "trunk_link" => low("trunk-fill", "trunk-low-zoom"),
             "primary" | "primary_link" => low("primary-fill", "primary-low-zoom"),
             "secondary" | "secondary_link" => low("secondary-fill", "secondary-low-zoom"),
-            "tertiary" => app.palette.get("tertiary-fill").unwrap(),
+            "tertiary" | "tertiary_link" => app.palette.get("tertiary-fill").unwrap(),
             "residential" | "unclassified" => app.palette.get("residential-fill").unwrap(),
             "living_street" => app.palette.get("living-street-fill").unwrap(),
             "pedestrian" => app.palette.get("pedestrian-fill").unwrap(),
@@ -652,12 +1090,50 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
         }
     };
 
-    let mut labeled: Vec<(&Line, Vec<(f32, f32)>)> = Vec::new();
     let show_casing = z >= 12 && vis.on_with_default("road-casing", 12, 19, z);
     let casing_alpha = vis.alpha("road-casing");
-    // casings
+    let show_fill = vis.on_with_default("road-fill", 5, 19, z);
+    let fill_alpha = vis.alpha("road-fill");
+    let show_tunnels = vis.is_visible("tunnels");
+    let show_bridges = vis.is_visible("bridges");
+    let dashes_for = |class: u8| -> Option<Vec<f32>> {
+        match road_class_name(class) {
+            "footway" | "path" => Some(vec![3.0, 2.4]),
+            "steps" => Some(vec![1.6, 1.6]),
+            "cycleway" => Some(vec![5.0, 2.4]),
+            _ => None,
+        }
+    };
+
+    // pass 1: tunnels (casing dashed + fill)
+    if show_tunnels && z >= 12 {
+        for r in &store.roads {
+            if !r.tunnel || r.bridge {
+                continue;
+            }
+            let width = road_width(r.class, z);
+            if width <= 0.0 || !in_tile(&r.bbox) || z < class_min_zoom(r.class) {
+                continue;
+            }
+            let pts = line_px(&r.pts);
+            if show_casing {
+                let c = vis.color("road-casing", casing_for(r.class));
+                let cw = width + if width >= 4.0 { 2.0 } else { 1.2 };
+                draw_line_dashed(&mut pixmap, &pts, cw, skia_color(c, 0.75 * casing_alpha), &[3.0, 2.2], &clip);
+            }
+            if show_fill {
+                let c = vis.color("road-fill", fill_for(app, r.class, z));
+                draw_line(&mut pixmap, &pts, width, skia_color(c, fill_alpha), &clip);
+            }
+        }
+    }
+
+    // pass 2: regular roads (skip tunnels & bridges; path classes get dashes)
     if show_casing {
         for r in &store.roads {
+            if (r.tunnel && show_tunnels) || (r.bridge && show_bridges) {
+                continue;
+            }
             let width = road_width(r.class, z);
             if width <= 0.0 || !in_tile(&r.bbox) {
                 continue;
@@ -667,48 +1143,213 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
             draw_line(&mut pixmap, &line_px(&r.pts), cw, skia_color(c, casing_alpha), &clip);
         }
     }
-    // fills
-    if vis.on_with_default("road-fill", 5, 19, z) {
-        let fa = vis.alpha("road-fill");
+    let mut labeled: Vec<(&Line, Vec<(f32, f32)>)> = Vec::new();
+    let mut shielded: Vec<(&Line, f32, f32)> = Vec::new();
+    if show_fill {
         for r in &store.roads {
+            if (r.tunnel && show_tunnels) || (r.bridge && show_bridges) {
+                continue;
+            }
             let width = road_width(r.class, z);
             if width <= 0.0 || !in_tile(&r.bbox) || z < class_min_zoom(r.class) {
                 continue;
             }
             let pts = line_px(&r.pts);
             let c = vis.color("road-fill", fill_for(app, r.class, z));
-            draw_line(&mut pixmap, &pts, width, skia_color(c, fa), &clip);
+            let dash_opt = if z >= 14 && !r.bridge && !r.tunnel { dashes_for(r.class) } else { None };
+            match dash_opt {
+                Some(dv) => draw_line_dashed(&mut pixmap, &pts, width, skia_color(c, fill_alpha), &dv, &clip),
+                None => draw_line(&mut pixmap, &pts, width, skia_color(c, fill_alpha), &clip),
+            }
             // ::directions — oneway arrows from z16 (roads.mss), under the labels
             if z >= 16 && r.oneway != 0 && width >= 1.4 && vis.on_with_default("road-oneway", 16, 19, z) {
                 if let Some(ac) = oneway_arrow_color(app, vis, r.class) {
-                    draw_oneway_arrows(&mut pixmap, &pts, skia_color(ac, fa), r.oneway == 2);
+                    draw_oneway_arrows(&mut pixmap, &pts, skia_color(ac, fill_alpha), r.oneway == 2);
                 }
             }
             let label_cap = 24 + usize::from(z.saturating_sub(14)) * 12;
             if z >= 13 && !r.name.is_empty() && width >= 1.8 && labeled.len() < label_cap {
-                labeled.push((r, pts));
+                labeled.push((r, pts.clone()));
+            }
+            if z >= 14 && !r.refs.is_empty() && matches!(road_class_name(r.class), "motorway" | "trunk" | "primary" | "secondary" | "motorway_link" | "trunk_link" | "primary_link" | "secondary_link") && shielded.len() < 8 {
+                let mid = pts[pts.len() / 2];
+                if mid.0 > 8.0 && mid.0 < 248.0 && mid.1 > 8.0 && mid.1 < 248.0 {
+                    shielded.push((r, mid.0, mid.1));
+                }
             }
         }
     }
 
-    /* ---- road labels ---- */
+    // pass 3: bridges (wider casing + fill over everything)
+    if show_bridges && z >= 12 {
+        for r in &store.roads {
+            if !r.bridge || r.tunnel {
+                continue;
+            }
+            let width = road_width(r.class, z);
+            if width <= 0.0 || !in_tile(&r.bbox) || z < class_min_zoom(r.class) {
+                continue;
+            }
+            let pts = line_px(&r.pts);
+            if show_casing {
+                let c = vis.color("road-casing", casing_for(r.class));
+                let cw = width + if width >= 4.0 { 2.6 } else { 1.8 };
+                draw_line(&mut pixmap, &pts, cw, skia_color(c, casing_alpha), &clip);
+            }
+            if show_fill {
+                let c = vis.color("road-fill", fill_for(app, r.class, z));
+                draw_line(&mut pixmap, &pts, width, skia_color(c, fill_alpha), &clip);
+            }
+        }
+    }
+
+    /* ---- railways (casing + two-tone fill like carto) ---- */
+    if vis.on_with_default("rail", 9, 19, z) && z >= 9 {
+        let ra = vis.alpha("rail");
+        let rc = vis.color("rail", carto_style::Rgba::rgb(0x8a, 0x8a, 0x8a));
+        let width = match z {
+            9 | 10 => 0.9,
+            11 | 12 => 1.4,
+            13 | 14 => 2.0,
+            _ => 2.6,
+        };
+        for r in &store.railways {
+            if in_tile(&r.bbox) {
+                draw_line(&mut pixmap, &line_px(&r.pts), width, skia_color(rc, ra), &clip);
+                if z >= 13 {
+                    // white dashes over the rail = carto's double-rail look
+                    draw_line_dashed(&mut pixmap, &line_px(&r.pts), width * 0.55, skia_color(carto_style::Rgba::rgb(0xff, 0xff, 0xff), 0.85 * ra), &[6.0, 6.0], &clip);
+                }
+            }
+        }
+    }
+
+    /* ---- ferry routes ---- */
+    if vis.on_with_default("ferry", 10, 19, z) && z >= 10 {
+        let fa = vis.alpha("ferry");
+        let fc = app.palette.get("ferry-route").unwrap_or(carto_style::Rgba::rgb(0x66, 0x66, 0xff));
+        let fc = vis.color("ferry", fc);
+        for f in &store.ferry {
+            if in_tile(&f.bbox) {
+                draw_line_dashed(&mut pixmap, &line_px(&f.pts), 1.1, skia_color(fc, fa), &[4.0, 3.0], &clip);
+            }
+        }
+    }
+
+    /* ---- admin boundaries (level ladder, halo + core line) ---- */
+    if vis.on_with_default("admin", 4, 19, z) {
+        let aa = vis.alpha("admin");
+        let core = app.palette.get("admin-boundaries").unwrap_or(carto_style::Rgba::rgb(0x8d, 0x61, 0x8b));
+        let core = vis.color("admin", core);
+        let wide = app.palette.get("admin-boundaries-wide").unwrap_or(carto_style::Rgba::rgb(0xa3, 0x7d, 0xa1));
+        let width = match z {
+            4..=6 => 0.9,
+            7..=8 => 1.2,
+            9..=10 => 1.4,
+            11..=12 => 1.7,
+            _ => 2.0,
+        };
+        for a in &store.admin {
+            let min = match a.level {
+                2 => 4,
+                4 => 7,
+                _ => 9,
+            };
+            if z < min || !in_tile(&a.bbox) {
+                continue;
+            }
+            let lvl_scale = if a.level <= 2 { 1.0 } else if a.level == 4 { 0.85 } else { 0.6 };
+            let pts = line_px(&a.pts);
+            draw_line(&mut pixmap, &pts, width * lvl_scale + 1.6, skia_color(wide, 0.45 * aa), &clip);
+            draw_line(&mut pixmap, &pts, width * lvl_scale, skia_color(core, aa), &clip);
+        }
+    }
+
+    /* ---- barriers / cliffs ---- */
+    if vis.on_with_default("fences", 16, 19, z) && z >= 16 {
+        let ba = vis.alpha("fences");
+        let bc = carto_style::Rgba::rgb(0x6a, 0x6a, 0x6a);
+        let bc = vis.color("fences", bc);
+        for b in &store.barriers {
+            if b.class == 9 || !in_tile(&b.bbox) {
+                continue;
+            }
+            let w = match b.class {
+                2 | 4 => 1.1, // city wall / retaining wall
+                _ => 0.8,
+            };
+            draw_line(&mut pixmap, &line_px(&b.pts), w, skia_color(bc, ba), &clip);
+        }
+    }
+    if vis.on_with_default("cliffs", 15, 19, z) && z >= 15 {
+        let ca = vis.alpha("cliffs");
+        let cc = carto_style::Rgba::rgb(0x70, 0x65, 0x5c);
+        let cc = vis.color("cliffs", cc);
+        for b in &store.barriers {
+            if b.class != 9 || !in_tile(&b.bbox) {
+                continue;
+            }
+            let pts = line_px(&b.pts);
+            draw_line(&mut pixmap, &pts, 0.9, skia_color(cc, ca), &clip);
+            // hash ticks along the cliff (carto's cliff pattern, simplified)
+            for seg in pts.windows(2) {
+                let (dx, dy) = (seg[1].0 - seg[0].0, seg[1].1 - seg[0].1);
+                let len = (dx * dx + dy * dy).sqrt();
+                let steps = (len / 9.0).floor() as usize;
+                let (ux, uy) = if len > 0.01 { (dx / len, dy / len) } else { continue };
+                for k in 1..=steps {
+                    let t = k as f32 * 9.0;
+                    let (px, py) = (seg[0].0 + ux * t, seg[0].1 + uy * t);
+                    draw_line(&mut pixmap, &[(px, py), (px - uy * 3.2 - ux, py + ux * 3.2 - uy)], 0.8, skia_color(cc, ca), &clip);
+                }
+            }
+        }
+    }
+
+    /* ---- tree rows & hedges ---- */
+    if vis.on_with_default("tree-rows", 16, 19, z) && z >= 16 {
+        let ta = vis.alpha("tree-rows");
+        let tc = carto_style::Rgba::rgb(0x6b, 0xa3, 0x68);
+        let tc = vis.color("tree-rows", tc);
+        for t in &store.tree_rows {
+            if in_tile(&t.bbox) {
+                draw_line(&mut pixmap, &line_px(&t.pts), 1.2, skia_color(tc, ta), &clip);
+            }
+        }
+    }
+
+    /* ---- golf / tracks / waterslides / roller coasters ---- */
+    if vis.on_with_default("misc", 13, 19, z) && z >= 13 {
+        let ma = vis.alpha("misc");
+        for m in &store.misc {
+            if !in_tile(&m.bbox) {
+                continue;
+            }
+            let pts = line_px(&m.pts);
+            match m.class {
+                0 => draw_line_dashed(&mut pixmap, &pts, 1.0, skia_color(carto_style::Rgba::rgb(0x8f, 0xaf, 0x8f), ma), &[4.0, 3.0], &clip),
+                1 => {
+                    if m.area && pts.len() >= 3 {
+                        draw_polygon(&mut pixmap, &pts, skia_color(carto_style::Rgba::rgb(0xab, 0xdf, 0xc2), 0.8 * ma), &clip);
+                    } else {
+                        draw_line(&mut pixmap, &pts, 1.6, skia_color(carto_style::Rgba::rgb(0x9b, 0xd0, 0x9b), ma), &clip);
+                    }
+                }
+                2 => draw_line(&mut pixmap, &pts, 1.0, skia_color(carto_style::Rgba::rgb(0x40, 0xcb, 0xa1), ma), &clip),
+                _ => draw_line(&mut pixmap, &pts, 1.5, skia_color(carto_style::Rgba::rgb(0xd6, 0x66, 0x66), ma), &clip),
+            }
+        }
+    }
+
+    /* ---- road labels (along-path) + ref shields ---- */
     if z >= 13 && vis.on_with_default("road-labels", 13, 19, z) && !labeled.is_empty() {
         let mut used: HashSet<(u16, u16)> = HashSet::new();
-        let size = if z >= 15 { 11.0 } else { 10.0 };
+        let size = if z >= 15 { 10.0 } else { 9.0 };
         let fnt: &Font = if z >= 15 { &app.font_bold } else { &app.font };
-        let shield = |class: u8| -> (u8, u8, u8) {
-            let c = match road_class_name(class) {
-                "motorway" | "motorway_link" => app.palette.get("motorway-shield"),
-                "trunk" | "trunk_link" => app.palette.get("trunk-shield"),
-                "primary" | "primary_link" => app.palette.get("primary-shield"),
-                "secondary" | "secondary_link" => app.palette.get("secondary-shield"),
-                "tertiary" => app.palette.get("tertiary-shield"),
-                _ => None,
-            };
-            c.map(|x| (x.r, x.g, x.b)).unwrap_or((0x3b, 0x3b, 0x3b))
-        };
+        let halo = app.palette.get("default-casing").map(|c| (c.r, c.g, c.b)).unwrap_or((255, 255, 255));
+        let ink = app.palette.get("road-labels-text").unwrap_or(carto_style::Rgba::rgb(0x33, 0x33, 0x33));
+        let ink = vis.color("road-labels", ink);
         for (r, pts) in &labeled {
-            // label at the middle vertex
             let mid = pts[pts.len() / 2];
             let gx = (mid.0 / 48.0) as u16;
             let gy = (mid.1 / 48.0) as u16;
@@ -718,24 +1359,79 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
             if mid.0 < 8.0 || mid.0 > 248.0 || mid.1 < 8.0 || mid.1 > 248.0 {
                 continue;
             }
-            let halo = app.palette.get("default-casing").map(|c| (c.r, c.g, c.b)).unwrap_or((255, 255, 255));
-            let base = carto_style::Rgba::rgb(shield(r.class).0, shield(r.class).1, shield(r.class).2);
-            let col = vis.color("road-labels", base);
-            draw_text(
-                &mut pixmap,
-                fnt,
-                &r.name,
-                mid.0,
-                mid.1 + size / 3.0,
-                size,
-                (col.r, col.g, col.b),
-                Some(halo),
-                &clip,
-            );
+            draw_text_along(&mut pixmap, fnt, &r.name, pts, size, (ink.r, ink.g, ink.b), Some(halo), &clip);
+        }
+    }
+    if z >= 14 && vis.on_with_default("road-refs", 14, 19, z) && !shielded.is_empty() {
+        let fnt = &app.font_bold;
+        for (r, sx, sy) in &shielded {
+            let shield = match road_class_name(r.class) {
+                "motorway" | "motorway_link" => app.palette.get("motorway-shield"),
+                "trunk" | "trunk_link" => app.palette.get("trunk-shield"),
+                "primary" | "primary_link" => app.palette.get("primary-shield"),
+                "secondary" | "secondary_link" => app.palette.get("secondary-shield"),
+                _ => None,
+            }
+            .map(|c| (c.r, c.g, c.b))
+            .unwrap_or((0x3b, 0x3b, 0x3b));
+            draw_shield(&mut pixmap, fnt, &r.refs, *sx, *sy, shield, &clip);
         }
     }
 
-    /* ---- POI dots + labels ---- */
+    /* ---- waterway names (river/canal/stream, along path) ---- */
+    if z >= 13 && vis.on_with_default("waterways-text", 13, 19, z) {
+        let mut count = 0;
+        for wway in &store.waterways {
+            if count >= 10 {
+                break;
+            }
+            if !matches!(wway.class, carto_core::WATER_RIVER | carto_core::WATER_CANAL | carto_core::WATER_STREAM) {
+                continue;
+            }
+            if wway.class == carto_core::WATER_STREAM && z < 15 {
+                continue;
+            }
+            if wway.name.is_empty() || !in_tile(&wway.bbox) {
+                continue;
+            }
+            let pts = line_px(&wway.pts);
+            let mid = pts[pts.len() / 2];
+            if mid.0 < 8.0 || mid.0 > 248.0 || mid.1 < 8.0 || mid.1 > 248.0 {
+                continue;
+            }
+            let ink = vis.color("waterways-text", carto_style::Rgba::rgb(0x4d, 0x70, 0x8a));
+            draw_text_along(&mut pixmap, &app.font, &wway.name, &pts, 9.5, (ink.r, ink.g, ink.b), Some((255, 255, 255)), &clip);
+            count += 1;
+        }
+    }
+
+    /* ---- building names ---- */
+    if z >= 16 && vis.on_with_default("building-text", 16, 19, z) {
+        let ink = vis.color("building-text", carto_style::Rgba::rgb(0x6b, 0x66, 0x5f));
+        let mut count = 0;
+        for b in &store.buildings {
+            if count >= 12 {
+                break;
+            }
+            if b.name.is_empty() || !in_tile(&b.bbox) {
+                continue;
+            }
+            let ring = line_px(&b.pts);
+            let (sum_x, sum_y, cnt) =
+                ring.iter().fold((0.0f32, 0.0f32, 0usize), |acc, p| (acc.0 + p.0, acc.1 + p.1, acc.2 + 1));
+            if cnt == 0 {
+                continue;
+            }
+            let (px, py) = (sum_x / cnt as f32, sum_y / cnt as f32);
+            if px < 8.0 || px > 248.0 || py < 8.0 || py > 248.0 {
+                continue;
+            }
+            draw_text(&mut pixmap, &app.font, &b.name, px, py + 3.0, 8.5, (ink.r, ink.g, ink.b), Some((255, 255, 255)), &clip);
+            count += 1;
+        }
+    }
+
+    /* ---- POI icons + labels ---- */
     if vis.on_with_default("pois", 14, 19, z) && z >= 14 {
         let pa = vis.alpha("pois");
         let accent = app.palette.get("motorway-casing").unwrap_or(carto_style::Rgba::rgb(0xdc, 0x2a, 0x67));
@@ -750,30 +1446,167 @@ pub fn render_tile_pixmap(app: &App, store: &Store, vis: &LayerVis, z: u8, x: u3
                 let (mx, my) = lonlat_to_merc(lon, lat);
                 ((mx * scale - ox) as f32, (my * scale - oy) as f32)
             };
-            if px < 4.0 || px > 252.0 || py < 4.0 || py > 252.0 || count >= 40 {
+            if px < 6.0 || px > 250.0 || py < 6.0 || py > 250.0 || count >= 60 {
+                continue;
+            }
+            if z < sprites::poi_min_zoom(&p.category) {
                 continue;
             }
             count += 1;
-            let mut pb = PathBuilder::new();
-            pb.push_circle(px, py, 2.4);
-            if let Some(path) = pb.finish() {
-                let paint = Paint { shader: tiny_skia::Shader::SolidColor(skia_color(accent, pa)), anti_alias: true, ..Default::default() };
-                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
-                let paint_w = Paint { shader: tiny_skia::Shader::SolidColor(Color::from_rgba8(255, 255, 255, 220)), anti_alias: true, ..Default::default() };
-                let mut pbc = PathBuilder::new();
-                pbc.push_circle(px, py, 2.4);
-                if let Some(ring) = pbc.finish() {
-                    pixmap.stroke_path(&ring, &paint_w, &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
-                }
+            let has_icon = sprites::poi_icon(&p.category).is_some();
+            let icon = sprites::poi_icon(&p.category).and_then(|path| app.sprites.icon(path));
+            match icon {
+                Some(sprite) => blit_sprite(&mut pixmap, &sprite, px, py, 16.0, pa),
+                None => draw_dot(&mut pixmap, px, py, 2.4, skia_color(accent, pa), Some(Color::from_rgba8(255, 255, 255, 220))),
             }
             if z >= 16 {
-                draw_text(&mut pixmap, &app.font, &p.name, px, py - 5.0, 9.0, (0x2c, 0x2c, 0x2c), Some((255, 255, 255)), &clip);
+                let dy = if has_icon { 11.0 } else { -5.0 };
+                draw_text(&mut pixmap, &app.font, &p.name, px, py + dy, 9.0, (0x2c, 0x2c, 0x2c), Some((255, 255, 255)), &clip);
+            }
+        }
+    }
+
+    /* ---- place labels (countries .. villages) ---- */
+    {
+        let halo = app.palette.get("default-casing").map(|c| (c.r, c.g, c.b)).unwrap_or((255, 255, 255));
+        let draw_place = |pixmap: &mut Pixmap, p: &carto_core::Place, min_z: u8, size: f32, bold: bool, ink: carto_style::Rgba, upper: bool| {
+            if z < min_z {
+                return;
+            }
+            let (lon, lat) = (f64::from(store.lon[p.idx as usize]), f64::from(store.lat[p.idx as usize]));
+            if lon < f64::from(tw) || lon > f64::from(te) || lat < f64::from(ts) || lat > f64::from(tn) {
+                return;
+            }
+            let (mx, my) = lonlat_to_merc(lon, lat);
+            let (px, py) = ((mx * scale - ox) as f32, (my * scale - oy) as f32);
+            if px < 10.0 || px > 246.0 || py < 10.0 || py > 246.0 {
+                return;
+            }
+            let fnt = if bold { &app.font_bold } else { &app.font };
+            let name = if upper { p.name.to_uppercase() } else { p.name.clone() };
+            let ink = vis.color_of_place(p.class, ink);
+            draw_text(pixmap, fnt, &name, px, py, size, (ink.r, ink.g, ink.b), Some(halo), &clip);
+        };
+        if vis.on_with_default("places-country", 4, 19, z) {
+            for p in &store.places {
+                if p.class == carto_core::PL_COUNTRY {
+                    draw_place(&mut pixmap, p, 4, 11.5, true, carto_style::Rgba::rgb(0x7a, 0x5b, 0x7a), true);
+                }
+            }
+        }
+        if vis.on_with_default("places-state", 5, 19, z) {
+            for p in &store.places {
+                if p.class == carto_core::PL_STATE {
+                    draw_place(&mut pixmap, p, 5, 9.5, false, carto_style::Rgba::rgb(0x7a, 0x5b, 0x7a), true);
+                }
+            }
+        }
+        if vis.on_with_default("places-city", 8, 19, z) {
+            for p in &store.places {
+                if p.class == carto_core::PL_CITY {
+                    let min = if p.capital { 7 } else { 8 };
+                    let size = if p.capital { 12.0 } else { 11.0 };
+                    draw_place(&mut pixmap, p, min, size, true, carto_style::Rgba::rgb(0x1a, 0x1a, 0x1a), false);
+                }
+            }
+        }
+        if vis.on_with_default("places-town", 10, 19, z) {
+            for p in &store.places {
+                if p.class == carto_core::PL_TOWN {
+                    draw_place(&mut pixmap, p, 10, 10.0, false, carto_style::Rgba::rgb(0x22, 0x22, 0x22), false);
+                }
+            }
+        }
+        if vis.on_with_default("places-small", 13, 19, z) {
+            for p in &store.places {
+                if p.class >= carto_core::PL_VILLAGE {
+                    draw_place(&mut pixmap, p, 13, 9.0, false, carto_style::Rgba::rgb(0x55, 0x55, 0x55), false);
+                }
+            }
+        }
+    }
+
+    /* ---- point features ---- */
+    if z >= 12 {
+        let halo = app.palette.get("default-casing").map(|c| (c.r, c.g, c.b)).unwrap_or((255, 255, 255));
+        for pt in &store.points {
+            let (lon, lat) = (f64::from(store.lon[pt.idx as usize]), f64::from(store.lat[pt.idx as usize]));
+            if lon < f64::from(tw) || lon > f64::from(te) || lat < f64::from(ts) || lat > f64::from(tn) {
+                continue;
+            }
+            let (mx, my) = lonlat_to_merc(lon, lat);
+            let (px, py) = ((mx * scale - ox) as f32, (my * scale - oy) as f32);
+            if px < 4.0 || px > 252.0 || py < 4.0 || py > 252.0 {
+                continue;
+            }
+            match pt.class {
+                carto_core::PT_PEAK if vis.on_with_default("peaks", 12, 19, z) => {
+                    draw_dot(&mut pixmap, px, py - 3.0, 2.2, Color::from_rgba8(0x6b, 0x59, 0x45, 255), None);
+                    let label = if pt.value > 0 { format!("{} {}", pt.name, pt.value) } else { pt.name.clone() };
+                    let ink = vis.color("peaks", carto_style::Rgba::rgb(0x50, 0x40, 0x30));
+                    draw_text(&mut pixmap, &app.font, &label, px, py + 8.0, 9.0, (ink.r, ink.g, ink.b), Some(halo), &clip);
+                }
+                carto_core::PT_STATION if vis.on_with_default("stations", 13, 19, z) && z >= 13 => {
+                    let sc = vis.color("stations", carto_style::Rgba::rgb(0x79, 0x81, 0xb0));
+                    draw_dot(&mut pixmap, px, py, 2.4, skia_color(sc, 1.0), Some(Color::from_rgba8(255, 255, 255, 230)));
+                    if !pt.name.is_empty() && z >= 14 {
+                        draw_text(&mut pixmap, &app.font_bold, &pt.name, px, py - 6.0, 9.0, (0x44, 0x44, 0x66), Some(halo), &clip);
+                    }
+                }
+                carto_core::PT_JUNCTION if vis.on_with_default("junctions", 13, 19, z) && z >= 13 && !pt.name.is_empty() => {
+                    draw_text(&mut pixmap, &app.font_bold, &pt.name, px, py + 3.0, 8.5, (0x33, 0x33, 0x33), Some(halo), &clip);
+                }
+                carto_core::PT_CROSSING if vis.on_with_default("crossings", 14, 19, z) && z >= 14 => {
+                    draw_dot(&mut pixmap, px, py, 1.8, Color::from_rgba8(0x33, 0x33, 0x33, 255), Some(Color::from_rgba8(255, 255, 255, 255)));
+                }
+                carto_core::PT_TOWER if vis.on_with_default("power-towers", 14, 19, z) && z >= 14 => {
+                    if let Some(sp) = app.sprites.icon("man_made/power_tower.svg") {
+                        blit_sprite(&mut pixmap, &sp, px, py, 11.0, vis.alpha("power-towers"));
+                    }
+                }
+                carto_core::PT_POLE if vis.on_with_default("power-towers", 16, 19, z) && z >= 16 => {
+                    draw_dot(&mut pixmap, px, py, 1.2, Color::from_rgba8(0x88, 0x88, 0x88, 255), None);
+                }
+                carto_core::PT_TREE if vis.on_with_default("trees", 16, 19, z) && z >= 16 => {
+                    draw_dot(&mut pixmap, px, py, 1.6, Color::from_rgba8(0x4d, 0x85, 0x4d, 235), None);
+                }
+                carto_core::PT_LAMP if vis.on_with_default("lamps", 17, 19, z) && z >= 17 => {
+                    draw_dot(&mut pixmap, px, py, 1.1, Color::from_rgba8(0xcc, 0xb4, 0x55, 255), None);
+                }
+                carto_core::PT_ENTRANCE if vis.on_with_default("entrances", 17, 19, z) && z >= 17 => {
+                    draw_dot(&mut pixmap, px, py, 1.4, Color::from_rgba8(0xff, 0xff, 0xff, 255), Some(Color::from_rgba8(0x44, 0x44, 0x44, 255)));
+                }
+                carto_core::PT_ADDRESS if vis.on_with_default("addresses", 17, 19, z) && z >= 17 && !pt.name.is_empty() => {
+                    draw_text(&mut pixmap, &app.font, &pt.name, px, py + 3.0, 8.0, (0x66, 0x66, 0x66), Some(halo), &clip);
+                }
+                carto_core::PT_SPRING if vis.on_with_default("peaks", 14, 19, z) && z >= 14 => {
+                    draw_dot(&mut pixmap, px, py, 1.8, Color::from_rgba8(0x6c, 0xa6, 0xd9, 255), None);
+                }
+                _ => {}
             }
         }
     }
 
     Some(pixmap)
 }
+
+
+impl LayerVis {
+    /// Colour override keyed by the place bucket the label belongs to, so a
+    /// user recolouring "Cities" also recolours capitals.
+    fn color_of_place(&self, class: u8, base: carto_style::Rgba) -> carto_style::Rgba {
+        let id = match class {
+            carto_core::PL_COUNTRY => "places-country",
+            carto_core::PL_STATE => "places-state",
+            carto_core::PL_CITY => "places-city",
+            carto_core::PL_TOWN => "places-town",
+            _ => "places-small",
+        };
+        self.color(id, base)
+    }
+}
+
+/// PNG-encoded tile (the HTTP server path).
 
 /// PNG-encoded tile (the HTTP server path).
 pub fn render_tile(app: &App, z: u8, x: u32, y: u32) -> Option<Vec<u8>> {
@@ -916,6 +1749,10 @@ fn route(app: &App, store: &Store, vis: &LayerVis, path: &str, qp: &HashMap<&str
                 landuse: store.landuse.len(),
                 buildings: store.buildings.len(),
                 pois: store.pois.len(),
+                places: store.places.len(),
+                ocean: store.ocean.len(),
+                islands: store.islands.len(),
+                admin: store.admin.len(),
                 bounds: store.bbox,
             };
             Response::json(200, serde_json::to_string(&dto).unwrap_or_default())
@@ -1257,6 +2094,7 @@ pub fn app_from_stack(stack: Stack) -> Arc<App> {
         font: stack.font,
         font_bold: stack.font_bold,
         symbol_count: stack.symbols.svg_count,
+        sprites: sprites::Sprites::new(),
         cache: Mutex::new(TileCache::new(768)),
         hits: AtomicUsize::new(0),
         misses: AtomicUsize::new(0),
